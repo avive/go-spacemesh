@@ -1,50 +1,81 @@
 package hare
 
 import (
+	"errors"
+	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/spacemeshos/go-spacemesh/log"
+	"github.com/spacemeshos/go-spacemesh/signing"
 )
 
 type messageValidator interface {
 	SyntacticallyValidateMessage(m *Msg) bool
-	ContextuallyValidateMessage(m *Msg, expectedK int32) bool
+	ContextuallyValidateMessage(m *Msg, expectedK int32) error
+}
+
+type identityProvider interface {
+	GetIdentity(edId string) (types.NodeId, error)
 }
 
 type eligibilityValidator struct {
-	oracle HareRolacle
+	oracle           Rolacle
+	layersPerEpoch   uint16
+	identityProvider identityProvider
+	maxExpActives    int // the maximal expected committee size
+	expLeaders       int // the expected number of leaders
 	log.Log
 }
 
-func NewEligibilityValidator(oracle HareRolacle, logger log.Log) *eligibilityValidator {
-	return &eligibilityValidator{oracle, logger}
+func newEligibilityValidator(oracle Rolacle, layersPerEpoch uint16, idProvider identityProvider, maxExpActives, expLeaders int, logger log.Log) *eligibilityValidator {
+	return &eligibilityValidator{oracle, layersPerEpoch, idProvider, maxExpActives, expLeaders, logger}
 }
 
-func (ev *eligibilityValidator) validateRole(m *Msg) bool {
+// check eligibility of the provided message by the oracle.
+func (ev *eligibilityValidator) validateRole(m *Msg) (bool, error) {
 	if m == nil {
 		ev.Error("Eligibility validator: called with nil")
-		return false
+		return false, errors.New("fatal: nil message")
 	}
 
 	if m.InnerMsg == nil {
-		ev.Warning("Eligibility validator: InnerMsg is nil")
-		return false
+		ev.Error("Eligibility validator: InnerMsg is nil")
+		return false, errors.New("fatal: nil inner message")
 	}
-
-	// TODO: validate role proof sig
 
 	pub := m.PubKey
-	// validate role
-	if !ev.oracle.Eligible(InstanceId(m.InnerMsg.InstanceId), m.InnerMsg.K, pub.String(), Signature(m.InnerMsg.RoleProof)) {
-		ev.Warning("Role validation failed")
-		return false
+	layer := types.LayerID(m.InnerMsg.InstanceId)
+	if layer.GetEpoch(ev.layersPerEpoch).IsGenesis() {
+		return true, nil // TODO: remove this lie after inception problem is addressed
 	}
 
-	return true
+	nId, err := ev.identityProvider.GetIdentity(pub.String())
+	if err != nil {
+		ev.With().Error("Eligibility validator: GetIdentity failed (ignore if the safe layer is in genesis)", log.Err(err), log.String("sender_id", pub.ShortString()))
+		return false, err
+	}
+
+	// validate role
+	res, err := ev.oracle.Eligible(layer, m.InnerMsg.K, expectedCommitteeSize(m.InnerMsg.K, ev.maxExpActives, ev.expLeaders), nId, m.InnerMsg.RoleProof)
+	if err != nil {
+		ev.With().Error("Eligibility validator: could not retrieve eligibility result", log.Err(err))
+		return false, err
+	}
+	if !res {
+		ev.With().Error("Eligibility validator: sender is not eligible to participate", log.String("sender_pub", pub.ShortString()))
+		return false, nil
+	}
+
+	return true, nil
 }
 
-// Validates eligibility and signature of the provided InnerMsg
+// Validate the eligibility of the provided message.
 func (ev *eligibilityValidator) Validate(m *Msg) bool {
+	res, err := ev.validateRole(m)
+	if err != nil {
+		ev.Error("Error occurred while validating role err=%v", err)
+		return false
+	}
 	// verify role
-	if !ev.validateRole(m) {
+	if !res {
 		ev.Warning("Validate message failed: role is invalid for pub %v", m.PubKey.ShortString())
 		return false
 	}
@@ -52,170 +83,271 @@ func (ev *eligibilityValidator) Validate(m *Msg) bool {
 	return true
 }
 
+type roleValidator interface {
+	Validate(m *Msg) bool
+}
+
+type pubKeyGetter interface {
+	Track(m *Msg)
+	PublicKey(m *Message) *signing.PublicKey
+}
+
 type syntaxContextValidator struct {
-	signing         Signer
-	threshold       int
-	statusValidator func(m *Msg) bool // used to validate status Messages in SVP
+	signing          Signer
+	threshold        int
+	statusValidator  func(m *Msg) bool // used to validate status Messages in SVP
+	stateQuerier     StateQuerier
+	layersPerEpoch   uint16
+	roleValidator    roleValidator
+	validMsgsTracker pubKeyGetter // used to check for public keys in the valid messages tracker
 	log.Log
 }
 
-func newSyntaxContextValidator(signing Signer, threshold int, validator func(m *Msg) bool, logger log.Log) *syntaxContextValidator {
-	return &syntaxContextValidator{signing, threshold, validator, logger}
+func newSyntaxContextValidator(sgr Signer, threshold int, validator func(m *Msg) bool, stateQuerier StateQuerier, layersPerEpoch uint16, ev roleValidator, validMsgsTracker pubKeyGetter, logger log.Log) *syntaxContextValidator {
+	return &syntaxContextValidator{sgr, threshold, validator, stateQuerier, layersPerEpoch, ev, validMsgsTracker, logger}
 }
 
-// Validates the InnerMsg is contextually valid
-func (validator *syntaxContextValidator) ContextuallyValidateMessage(m *Msg, expectedK int32) bool {
-	if m.InnerMsg == nil {
-		validator.Warning("Contextual validation failed: m.InnerMsg is nil")
-		return false
-	}
+// contextual validation errors
+var (
+	errNilMsg         = errors.New("nil message")
+	errNilInner       = errors.New("nil inner message")
+	errEarlyMsg       = errors.New("early message")
+	errInvalidIter    = errors.New("incorrect iteration number")
+	errInvalidRound   = errors.New("incorrect round")
+	errUnexpectedType = errors.New("unexpected message type")
+)
 
-	// PreRound & Notify are always contextually valid
-	switch m.InnerMsg.Type {
-	case PreRound:
-		return true
-	case Notify:
-		return true
-	}
-
-	// Status, Proposal, Commit Messages should match the expected K
-	if expectedK == m.InnerMsg.K {
-		return true
-	}
-
-	validator.Info("Contextual validation failed: not same iteration. Expected: %v, Actual: %v", expectedK, m.InnerMsg.K)
-	return false
-}
-
-// Validates the syntax of the provided InnerMsg
-func (validator *syntaxContextValidator) SyntacticallyValidateMessage(m *Msg) bool {
+// ContextuallyValidateMessage checks if the message is contextually valid.
+// Returns nil if the message is contextually valid or a suitable error otherwise.
+func (v *syntaxContextValidator) ContextuallyValidateMessage(m *Msg, currentK int32) error {
 	if m == nil {
-		validator.Warning("Syntax validation failed: m is nil")
+		return errNilMsg
+	}
+
+	if m.InnerMsg == nil {
+		return errNilInner
+	}
+	currentRound := currentK % 4
+	// the message must match the current iteration unless it is a notify or pre-round message
+	currentIteration := currentK / 4
+	msgIteration := m.InnerMsg.K / 4
+	sameIter := currentIteration == msgIteration
+
+	// first validate pre-round and notify
+	switch m.InnerMsg.Type {
+	case pre:
+		return nil
+	case notify:
+		// notify before notify could be created for this iteration
+		if currentRound < commitRound && sameIter {
+			return errInvalidRound
+		}
+
+		// old notify is accepted
+		if m.InnerMsg.K <= currentK {
+			return nil
+		}
+
+		// early notify detected
+		if m.InnerMsg.K == currentK+1 && currentRound == commitRound {
+			return errEarlyMsg
+		}
+
+		// future notify is rejected
+		return errInvalidIter
+	}
+
+	// check status, proposal & commit types
+	switch m.InnerMsg.Type {
+	case status:
+		if currentRound == preRound && sameIter {
+			return errEarlyMsg
+		}
+		if currentRound == notifyRound && currentIteration+1 == msgIteration {
+			return errEarlyMsg
+		}
+		if currentRound == statusRound && sameIter {
+			return nil
+		}
+		if !sameIter {
+			return errInvalidIter
+		}
+		return errInvalidRound
+	case proposal:
+		if currentRound == statusRound && sameIter {
+			return errEarlyMsg
+		}
+		// a late proposal is also contextually valid
+		if (currentRound == proposalRound || currentRound == commitRound) && sameIter {
+			return nil
+		}
+		if !sameIter {
+			return errInvalidIter
+		}
+		return errInvalidRound
+	case commit:
+		if currentRound == proposalRound && sameIter {
+			return errEarlyMsg
+		}
+		if currentRound == commitRound && sameIter {
+			return nil
+		}
+		if !sameIter {
+			return errInvalidIter
+		}
+		return errInvalidRound
+	}
+
+	return errUnexpectedType
+}
+
+// SyntacticallyValidateMessage the syntax of the provided message.
+func (v *syntaxContextValidator) SyntacticallyValidateMessage(m *Msg) bool {
+	if m == nil {
+		v.Warning("Syntax validation failed: m is nil")
 		return false
 	}
 
 	if m.PubKey == nil {
-		validator.Warning("Syntax validation failed: missing public key")
+		v.Warning("Syntax validation failed: missing public key")
 		return false
 	}
 
 	if m.InnerMsg == nil {
-		validator.Warning("Syntax validation failed: inner message is nil")
+		v.Warning("Syntax validation failed: inner message is nil")
 		return false
 	}
 
 	if m.InnerMsg.Values == nil {
-		validator.Warning("Syntax validation failed: Values is nil in msg: %v", m)
+		v.With().Warning("Syntax validation failed: set is nil", log.String("msg", m.String()))
 		return false
 	}
 
 	if len(m.InnerMsg.Values) == 0 {
-		validator.Warning("Syntax validation failed: Values is empty: %v", m)
+		v.With().Warning("Syntax validation failed: set is empty", log.String("msg", m.String()))
 		return false
 	}
 
 	claimedRound := m.InnerMsg.K % 4
 	switch m.InnerMsg.Type {
-	case PreRound:
+	case pre:
 		return true
-	case Status:
-		return claimedRound == Round1
-	case Proposal:
-		return claimedRound == Round2 && validator.validateSVP(m)
-	case Commit:
-		return claimedRound == Round3
-	case Notify:
-		return validator.validateCertificate(m.InnerMsg.Cert)
+	case status:
+		return claimedRound == statusRound
+	case proposal:
+		return claimedRound == proposalRound && v.validateSVP(m)
+	case commit:
+		return claimedRound == commitRound
+	case notify:
+		return v.validateCertificate(m.InnerMsg.Cert)
 	default:
-		validator.Error("Unknown message type encountered during syntactic validator: ", m.InnerMsg.Type)
+		v.Error("Unknown message type encountered during syntactic validator: ", m.InnerMsg.Type)
 		return false
 	}
 }
 
-func (validator *syntaxContextValidator) validateAggregatedMessage(aggMsg *AggregatedMessages, validators []func(m *Msg) bool) bool {
+var (
+	errNilValidators     = errors.New("validators param is nil")
+	errNilAggMsgs        = errors.New("aggMsg is nil")
+	errNilMsgsSlice      = errors.New("messages slice is nil")
+	errMsgsCountMismatch = errors.New("number of messages does not match the threshold")
+	errDupSender         = errors.New("duplicate sender detected")
+	errInnerSyntax       = errors.New("invalid syntax for inner message")
+	errInnerEligibility  = errors.New("inner message is not eligible")
+	errInnerFunc         = errors.New("inner message did not pass validation function")
+)
+
+// validate the provided aggregated messages by the provided validators.
+func (v *syntaxContextValidator) validateAggregatedMessage(aggMsg *aggregatedMessages, validators []func(m *Msg) bool) error {
 	if validators == nil {
-		validator.Error("Aggregated validation failed: validators param is nil")
-		return false
+		return errNilValidators
 	}
 
 	if aggMsg == nil {
-		validator.Warning("Aggregated validation failed: aggMsg is nil")
-		return false
+		return errNilAggMsgs
 	}
 
 	if aggMsg.Messages == nil { // must contain status Messages
-		validator.Warning("Aggregated validation failed: Messages slice is nil")
-		return false
+		return errNilMsgsSlice
 	}
 
-	if len(aggMsg.Messages) != validator.threshold { // must include exactly f+1 Messages
-		validator.Warning("Aggregated validation failed: number of Messages does not match. Expected: %v Actual: %v",
-			validator.threshold, len(aggMsg.Messages))
-		return false
+	if len(aggMsg.Messages) != v.threshold { // must include exactly f+1 Messages
+		v.Warning("Aggregated validation failed: number of messages does not match. Expected: %v Actual: %v",
+			v.threshold, len(aggMsg.Messages))
+		return errMsgsCountMismatch
 	}
-
-	// TODO: validate agg sig
 
 	senders := make(map[string]struct{})
 	for _, innerMsg := range aggMsg.Messages {
-		// TODO: refill Values in commit on certificate
 
-		// TODO: should receive the state querier
-		iMsg, err := newMsg(innerMsg, MockStateQuerier{true, nil})
+		// check if exist in cache of valid messages
+		if pub := v.validMsgsTracker.PublicKey(innerMsg); pub != nil {
+			// validate unique sender
+			if _, exist := senders[pub.String()]; exist { // pub already exist
+				return errDupSender
+			}
+			senders[pub.String()] = struct{}{} // mark sender as exist
+
+			// passed validation, continue to next message
+			continue
+		}
+
+		// extract public key
+		iMsg, err := newMsg(innerMsg, v.stateQuerier, v.layersPerEpoch)
 		if err != nil {
-			validator.Warning("Aggregated validation failed: could not construct msg")
-			return false
+			return err
 		}
 
-		if !validator.SyntacticallyValidateMessage(iMsg) {
-			validator.Warning("Aggregated validation failed: identified an invalid inner message %v", iMsg)
-			return false
-		}
-
-		// validate unique sender
 		pub := iMsg.PubKey
-		if err != nil {
-			validator.Warning("Aggregated validation failed: could not construct pub: %v", err)
-			return false
-		}
+		// validate unique sender
 		if _, exist := senders[pub.String()]; exist { // pub already exist
-			validator.Warning("Aggregated validation failed: detected same pubKey for different Messages")
-			return false
+			return errDupSender
 		}
 		senders[pub.String()] = struct{}{} // mark sender as exist
+
+		if !v.SyntacticallyValidateMessage(iMsg) {
+			return errInnerSyntax
+		}
+
+		// validate role
+		if !v.roleValidator.Validate(iMsg) {
+			return errInnerEligibility
+		}
 
 		// validate with attached validators
 		for _, vFunc := range validators {
 			if !vFunc(iMsg) {
-				validator.Warning("Aggregated validation failed: attached vFunc failed")
-				return false
+				return errInnerFunc
 			}
 		}
+
+		// the message is valid, track it
+		v.validMsgsTracker.Track(iMsg)
 	}
 
-	return true
+	return nil
 }
 
-func (validator *syntaxContextValidator) validateSVP(msg *Msg) bool {
+func (v *syntaxContextValidator) validateSVP(msg *Msg) bool {
+	proposalIter := iterationFromCounter(msg.InnerMsg.K)
 	validateSameIteration := func(m *Msg) bool {
-		proposalIter := iterationFromCounter(msg.InnerMsg.K)
 		statusIter := iterationFromCounter(m.InnerMsg.K)
 		if proposalIter != statusIter { // not same iteration
-			validator.Warning("Proposal validation failed: not same iteration. Expected: %v Actual: %v",
+			v.Warning("Proposal validation failed: not same iteration. Expected: %v Actual: %v",
 				proposalIter, statusIter)
 			return false
 		}
 
 		return true
 	}
-	validators := []func(m *Msg) bool{validateStatusType, validateSameIteration, validator.statusValidator}
-	if !validator.validateAggregatedMessage(msg.InnerMsg.Svp, validators) {
-		validator.Warning("Proposal validation failed: failed to validate aggregated message")
+	validators := []func(m *Msg) bool{validateStatusType, validateSameIteration, v.statusValidator}
+	if err := v.validateAggregatedMessage(msg.InnerMsg.Svp, validators); err != nil {
+		v.With().Warning("Proposal validation failed: failed to validate aggregated messages", log.Err(err))
 		return false
 	}
 
 	maxKi := int32(-1) // Ki>=-1
-	var maxSet []uint64 = nil
+	var maxSet []types.BlockID = nil
 	for _, status := range msg.InnerMsg.Svp.Messages {
 		// track max
 		if status.InnerMsg.Ki > maxKi {
@@ -225,13 +357,13 @@ func (validator *syntaxContextValidator) validateSVP(msg *Msg) bool {
 	}
 
 	if maxKi == -1 { // type A
-		if !validator.validateSVPTypeA(msg) {
-			validator.Warning("Proposal validation failed: type A validation failed")
+		if !v.validateSVPTypeA(msg) {
+			v.Warning("Proposal validation failed: type A validation failed")
 			return false
 		}
 	} else {
-		if !validator.validateSVPTypeB(msg, NewSet(maxSet)) { // type B
-			validator.Warning("Proposal validation failed: type B validation failed")
+		if !v.validateSVPTypeB(msg, NewSet(maxSet)) { // type B
+			v.Warning("Proposal validation failed: type B validation failed")
 			return false
 		}
 	}
@@ -239,22 +371,22 @@ func (validator *syntaxContextValidator) validateSVP(msg *Msg) bool {
 	return true
 }
 
-func (validator *syntaxContextValidator) validateCertificate(cert *Certificate) bool {
+func (v *syntaxContextValidator) validateCertificate(cert *certificate) bool {
 	if cert == nil {
-		validator.Warning("Certificate validation failed: certificate is nil")
+		v.Warning("Certificate validation failed: certificate is nil")
 		return false
 	}
 
 	// verify agg msgs
 	if cert.AggMsgs == nil {
-		validator.Warning("Certificate validation failed: AggMsgs is nil")
+		v.Warning("Certificate validation failed: AggMsgs is nil")
 		return false
 	}
 
 	// refill Values
 	for _, commit := range cert.AggMsgs.Messages {
 		if commit.InnerMsg == nil {
-			validator.Warning("Certificate validation failed: inner commit message is nil")
+			v.Warning("Certificate validation failed: inner commit message is nil")
 			return false
 		}
 
@@ -264,8 +396,8 @@ func (validator *syntaxContextValidator) validateCertificate(cert *Certificate) 
 	// Note: no need to validate notify.Values=commits.Values because we refill the InnerMsg with notify.Values
 	validateSameK := func(m *Msg) bool { return m.InnerMsg.K == cert.AggMsgs.Messages[0].InnerMsg.K }
 	validators := []func(m *Msg) bool{validateCommitType, validateSameK}
-	if !validator.validateAggregatedMessage(cert.AggMsgs, validators) {
-		validator.Warning("Certificate validation failed: aggregated Messages validation failed")
+	if err := v.validateAggregatedMessage(cert.AggMsgs, validators); err != nil {
+		v.With().Warning("Certificate validation failed: aggregated messages validation failed", log.Err(err))
 		return false
 	}
 
@@ -273,28 +405,27 @@ func (validator *syntaxContextValidator) validateCertificate(cert *Certificate) 
 }
 
 func validateCommitType(m *Msg) bool {
-	return MessageType(m.InnerMsg.Type) == Commit
+	return messageType(m.InnerMsg.Type) == commit
 }
 
 func validateStatusType(m *Msg) bool {
-	return MessageType(m.InnerMsg.Type) == Status
+	return messageType(m.InnerMsg.Type) == status
 }
 
 // validate SVP for type A (where all Ki=-1)
-func (validator *syntaxContextValidator) validateSVPTypeA(m *Msg) bool {
+func (v *syntaxContextValidator) validateSVPTypeA(m *Msg) bool {
 	s := NewSet(m.InnerMsg.Values)
 	unionSet := NewEmptySet(len(m.InnerMsg.Values))
 	for _, status := range m.InnerMsg.Svp.Messages {
 		statusSet := NewSet(status.InnerMsg.Values)
 		// build union
-		for _, buff := range statusSet.values {
-			bid := buff
+		for bid := range statusSet.values {
 			unionSet.Add(bid) // assuming add is unique
 		}
 	}
 
 	if !unionSet.Equals(s) { // s should be the union of all statuses
-		validator.Warning("Proposal type A validation failed: not a union. Expected: %v Actual: %v", s, unionSet)
+		v.Warning("Proposal type A validation failed: not a union. Expected: %v Actual: %v", s, unionSet)
 		return false
 	}
 
@@ -302,11 +433,11 @@ func (validator *syntaxContextValidator) validateSVPTypeA(m *Msg) bool {
 }
 
 // validate SVP for type B (where exist Ki>=0)
-func (validator *syntaxContextValidator) validateSVPTypeB(msg *Msg, maxSet *Set) bool {
+func (v *syntaxContextValidator) validateSVPTypeB(msg *Msg, maxSet *Set) bool {
 	// max set should be equal to the claimed set
 	s := NewSet(msg.InnerMsg.Values)
 	if !s.Equals(maxSet) {
-		validator.Warning("Proposal type B validation failed: max set not equal to proposed set. Expected: %v Actual: %v", s, maxSet)
+		v.Warning("Proposal type B validation failed: max set not equal to proposed set. Expected: %v Actual: %v", s, maxSet)
 		return false
 	}
 

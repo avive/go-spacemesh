@@ -3,19 +3,24 @@ package main
 import (
 	"fmt"
 	cmdp "github.com/spacemeshos/go-spacemesh/cmd"
+	"github.com/spacemeshos/go-spacemesh/common/types"
+	"github.com/spacemeshos/go-spacemesh/common/util"
 	"github.com/spacemeshos/go-spacemesh/hare"
 	"github.com/spacemeshos/go-spacemesh/log"
+	"github.com/spacemeshos/go-spacemesh/monitoring"
 	"github.com/spacemeshos/go-spacemesh/oracle"
 	"github.com/spacemeshos/go-spacemesh/p2p"
 	"github.com/spacemeshos/go-spacemesh/signing"
 	"github.com/spacemeshos/go-spacemesh/timesync"
-	"github.com/spacemeshos/go-spacemesh/types"
 	"github.com/spf13/cobra"
+	"net/http"
 	"os"
+	"runtime"
+	"runtime/pprof"
 	"time"
 )
 
-const defaultSetSize = 200
+import _ "net/http/pprof"
 
 // Hare cmd
 var Cmd = &cobra.Command{
@@ -25,6 +30,13 @@ var Cmd = &cobra.Command{
 		log.JSONLog(true)
 		hareApp := NewHareApp()
 		defer hareApp.Cleanup()
+
+		// monitor app
+		hareApp.updater = monitoring.NewMemoryUpdater()
+		hareApp.monitor = monitoring.NewMonitor(1*time.Second, 5*time.Second, hareApp.updater, make(chan struct{}))
+		hareApp.monitor.Start()
+
+		// start app
 		hareApp.Initialize(cmd)
 		hareApp.Start(cmd, args)
 		<-hareApp.ha.CloseChannel()
@@ -36,25 +48,25 @@ func init() {
 }
 
 type mockBlockProvider struct {
-	isPulled bool
 }
 
 func (mbp *mockBlockProvider) GetUnverifiedLayerBlocks(layerId types.LayerID) ([]types.BlockID, error) {
-	if mbp.isPulled {
-		return []types.BlockID{}, nil
-	}
-
-	mbp.isPulled = true
-	return []types.BlockID{1, 2, 3}, nil
+	return buildSet(), nil
 }
 
 type HareApp struct {
 	*cmdp.BaseApp
-	p2p    p2p.Service
-	oracle *oracle.OracleClient
-	sgn    hare.Signer
-	ha     *hare.Hare
-	clock  *timesync.Ticker
+	p2p     p2p.Service
+	oracle  *oracle.OracleClient
+	sgn     hare.Signer
+	ha      *hare.Hare
+	clock   *timesync.Ticker
+	updater *monitoring.MemoryUpdater
+	monitor *monitoring.Monitor
+}
+
+func IsSynced() bool {
+	return true
 }
 
 func NewHareApp() *HareApp {
@@ -66,18 +78,60 @@ func (app *HareApp) Cleanup() {
 	app.oracle.Unregister(true, app.sgn.PublicKey().String())
 }
 
-func buildSet() *hare.Set {
-	s := hare.NewEmptySet(defaultSetSize)
+func buildSet() []types.BlockID {
+	s := make([]types.BlockID, 200, 200)
 
-	for i := uint64(0); i < defaultSetSize; i++ {
-		s.Add(hare.NewValue(i))
+	for i := uint64(0); i < 200; i++ {
+		s = append(s, types.NewExistingBlock(1, util.Uint64ToBytes(i)).Id())
 	}
 
 	return s
 }
 
+type mockIdProvider struct {
+}
+
+func (mip *mockIdProvider) GetIdentity(edId string) (types.NodeId, error) {
+	return types.NodeId{Key: edId, VRFPublicKey: []byte{}}, nil
+}
+
+type mockStateQuerier struct {
+}
+
+func (msq mockStateQuerier) IsIdentityActiveOnConsensusView(edId string, layer types.LayerID) (bool, error) {
+	return true, nil
+}
+
+func validateBlocks(blocks []types.BlockID) bool {
+	return true
+}
+
 func (app *HareApp) Start(cmd *cobra.Command, args []string) {
 	log.Info("Starting hare main")
+
+	if app.Config.MemProfile != "" {
+		log.Info("Starting mem profiling")
+		f, err := os.Create(app.Config.MemProfile)
+		if err != nil {
+			log.Error("could not create memory profile: ", err)
+		}
+		defer f.Close()
+		runtime.GC() // get up-to-date statistics
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			log.Error("could not write memory profile: ", err)
+		}
+	}
+
+	if app.Config.PprofHttpServer {
+		log.Info("Starting pprof server")
+		go func() {
+			err := http.ListenAndServe(":6060", nil)
+			if err != nil {
+				log.Error("cannot start http server", err)
+			}
+		}()
+	}
+
 	log.Info("Initializing P2P services")
 	swarm, err := p2p.New(cmdp.Ctx, app.Config.P2P)
 	app.p2p = swarm
@@ -101,7 +155,7 @@ func (app *HareApp) Start(cmd *cobra.Command, args []string) {
 	ld := time.Duration(app.Config.LayerDurationSec) * time.Second
 	app.clock = timesync.NewTicker(timesync.RealClock{}, ld, gTime)
 
-	app.ha = hare.New(app.Config.HARE, app.p2p, app.sgn, &mockBlockProvider{}, hareOracle, hare.NewMockStateQuerier(), app.clock.Subscribe(), lg)
+	app.ha = hare.New(app.Config.HARE, app.p2p, app.sgn, types.NodeId{Key: app.sgn.PublicKey().String(), VRFPublicKey: []byte{}}, validateBlocks, IsSynced, &mockBlockProvider{}, hareOracle, uint16(app.Config.LayersPerEpoch), &mockIdProvider{}, &mockStateQuerier{}, app.clock.Subscribe(), lg)
 	log.Info("Starting hare service")
 	err = app.ha.Start()
 	if err != nil {
@@ -111,7 +165,7 @@ func (app *HareApp) Start(cmd *cobra.Command, args []string) {
 	if err != nil {
 		log.Panic("error starting p2p err=%v", err)
 	}
-	app.clock.Start()
+	app.clock.StartNotifying()
 }
 
 func main() {

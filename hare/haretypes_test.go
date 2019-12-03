@@ -1,7 +1,10 @@
 package hare
 
 import (
+	"bytes"
+	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/stretchr/testify/assert"
+	"sort"
 	"testing"
 )
 
@@ -74,7 +77,7 @@ func TestSet_Intersection(t *testing.T) {
 }
 
 func TestSet_Contains(t *testing.T) {
-	s := NewSmallEmptySet()
+	s := NewDefaultEmptySet()
 	assert.False(t, s.Contains(value1))
 	s.Add(value1)
 	assert.True(t, s.Contains(value1))
@@ -96,4 +99,12 @@ func TestSet_Union(t *testing.T) {
 	s := NewSetFromValues(value1, value5)
 	exp := NewSetFromValues(value1, value2, value3, value4, value5)
 	assert.True(t, exp.Equals(s.Union(g)))
+}
+
+func TestSet_ToSlice(t *testing.T) {
+	arr := []types.BlockID{value7, value1, value5, value6, value2, value3, value4}
+	s := NewSet(arr)
+	res := s.ToSlice()
+	sort.Slice(arr, func(i, j int) bool { return bytes.Compare(arr[i].ToBytes(), arr[j].ToBytes()) == -1 })
+	assert.Equal(t, arr, res) // check result is sorted, required for order of set in commit msgs
 }

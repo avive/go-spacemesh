@@ -1,10 +1,10 @@
 package hare
 
 import (
+	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/spacemeshos/go-spacemesh/eligibility"
 	"github.com/spacemeshos/go-spacemesh/hare/config"
 	"github.com/spacemeshos/go-spacemesh/log"
-	"github.com/spacemeshos/go-spacemesh/p2p"
 	"github.com/spacemeshos/go-spacemesh/p2p/service"
 	signing2 "github.com/spacemeshos/go-spacemesh/signing"
 	"testing"
@@ -16,7 +16,7 @@ import (
 var skipBlackBox = false
 
 type fullRolacle interface {
-	Registrable
+	registrable
 	Rolacle
 }
 
@@ -98,7 +98,7 @@ func (his *HareSuite) checkResult(t *testing.T) {
 	}
 
 	// check that the output has no intersection with the complement of the union of honest
-	for _, v := range his.outputs[0].values {
+	for v := range his.outputs[0].values {
 		if union.Complement(u).Contains(v) {
 			t.Error("Validity 2 failed: unexpected value encountered: ", v)
 		}
@@ -133,14 +133,15 @@ func (test *ConsensusTest) Start() {
 	go startProcs(test.dishonest)
 }
 
-func createConsensusProcess(isHonest bool, cfg config.Config, oracle fullRolacle, network p2p.Service, initialSet *Set) *ConsensusProcess {
-	broker := buildBroker(network)
+func createConsensusProcess(isHonest bool, cfg config.Config, oracle fullRolacle, network NetworkService, initialSet *Set, layer instanceId, name string) *ConsensusProcess {
+	broker := buildBroker(network, name)
 	broker.Start()
 	output := make(chan TerminationOutput, 1)
 	signing := signing2.NewEdSigner()
 	oracle.Register(isHonest, signing.PublicKey().String())
-	proc := NewConsensusProcess(cfg, instanceId1, initialSet, oracle, signing, network, output, log.NewDefault(signing.PublicKey().String()[:8]))
-	proc.SetInbox(broker.Register(proc.Id()))
+	proc := NewConsensusProcess(cfg, layer, initialSet, oracle, NewMockStateQuerier(), 10, signing, types.NodeId{Key: signing.PublicKey().String(), VRFPublicKey: []byte{}}, network, output, truer{}, log.NewDefault(signing.PublicKey().ShortString()))
+	c, _ := broker.Register(proc.Id())
+	proc.SetInbox(c)
 
 	return proc
 }
@@ -152,7 +153,7 @@ func TestConsensusFixedOracle(t *testing.T) {
 
 	test := newConsensusTest()
 
-	cfg := config.Config{N: 16, F: 8, RoundDuration: 1}
+	cfg := config.Config{N: 16, F: 8, RoundDuration: 2, ExpectedLeaders: 5, LimitIterations: 1000}
 	sim := service.NewSimulator()
 	totalNodes := 20
 	test.initialSets = make([]*Set, totalNodes)
@@ -163,7 +164,7 @@ func TestConsensusFixedOracle(t *testing.T) {
 	i := 0
 	creationFunc := func() {
 		s := sim.NewNode()
-		proc := createConsensusProcess(true, cfg, oracle, s, test.initialSets[i])
+		proc := createConsensusProcess(true, cfg, oracle, s, test.initialSets[i], 1, t.Name())
 		test.procs = append(test.procs, proc)
 		i++
 	}
@@ -179,7 +180,7 @@ func TestSingleValueForHonestSet(t *testing.T) {
 
 	test := newConsensusTest()
 
-	cfg := config.Config{N: 50, F: 25, RoundDuration: 1}
+	cfg := config.Config{N: 50, F: 25, RoundDuration: 3, ExpectedLeaders: 5, LimitIterations: 1000}
 	totalNodes := 50
 	sim := service.NewSimulator()
 	test.initialSets = make([]*Set, totalNodes)
@@ -190,7 +191,7 @@ func TestSingleValueForHonestSet(t *testing.T) {
 	i := 0
 	creationFunc := func() {
 		s := sim.NewNode()
-		proc := createConsensusProcess(true, cfg, oracle, s, test.initialSets[i])
+		proc := createConsensusProcess(true, cfg, oracle, s, test.initialSets[i], 1, t.Name())
 		test.procs = append(test.procs, proc)
 		i++
 	}
@@ -206,7 +207,7 @@ func TestAllDifferentSet(t *testing.T) {
 
 	test := newConsensusTest()
 
-	cfg := config.Config{N: 10, F: 5, RoundDuration: 1}
+	cfg := config.Config{N: 10, F: 5, RoundDuration: 2, ExpectedLeaders: 5, LimitIterations: 1000}
 	sim := service.NewSimulator()
 	totalNodes := 10
 	test.initialSets = make([]*Set, totalNodes)
@@ -227,7 +228,7 @@ func TestAllDifferentSet(t *testing.T) {
 	i := 0
 	creationFunc := func() {
 		s := sim.NewNode()
-		proc := createConsensusProcess(true, cfg, oracle, s, test.initialSets[i])
+		proc := createConsensusProcess(true, cfg, oracle, s, test.initialSets[i], 1, t.Name())
 		test.procs = append(test.procs, proc)
 		i++
 	}
@@ -243,7 +244,7 @@ func TestSndDelayedDishonest(t *testing.T) {
 
 	test := newConsensusTest()
 
-	cfg := config.Config{N: 50, F: 25, RoundDuration: 2}
+	cfg := config.Config{N: 50, F: 25, RoundDuration: 3, ExpectedLeaders: 5, LimitIterations: 1000}
 	totalNodes := 50
 	sim := service.NewSimulator()
 	test.initialSets = make([]*Set, totalNodes)
@@ -258,7 +259,7 @@ func TestSndDelayedDishonest(t *testing.T) {
 	i := 0
 	honestFunc := func() {
 		s := sim.NewNode()
-		proc := createConsensusProcess(true, cfg, oracle, s, test.initialSets[i])
+		proc := createConsensusProcess(true, cfg, oracle, s, test.initialSets[i], 1, t.Name())
 		test.procs = append(test.procs, proc)
 		i++
 	}
@@ -269,7 +270,7 @@ func TestSndDelayedDishonest(t *testing.T) {
 	// create dishonest
 	dishonestFunc := func() {
 		s := sim.NewFaulty(true, 5, 0) // only broadcast delay
-		proc := createConsensusProcess(false, cfg, oracle, s, test.initialSets[i])
+		proc := createConsensusProcess(false, cfg, oracle, s, test.initialSets[i], 1, t.Name())
 		test.dishonest = append(test.dishonest, proc)
 		i++
 	}
@@ -286,7 +287,7 @@ func TestRecvDelayedDishonest(t *testing.T) {
 
 	test := newConsensusTest()
 
-	cfg := config.Config{N: 50, F: 25, RoundDuration: 2}
+	cfg := config.Config{N: 50, F: 25, RoundDuration: 3, ExpectedLeaders: 5, LimitIterations: 1000}
 	totalNodes := 50
 	sim := service.NewSimulator()
 	test.initialSets = make([]*Set, totalNodes)
@@ -301,7 +302,7 @@ func TestRecvDelayedDishonest(t *testing.T) {
 	i := 0
 	honestFunc := func() {
 		s := sim.NewNode()
-		proc := createConsensusProcess(true, cfg, oracle, s, test.initialSets[i])
+		proc := createConsensusProcess(true, cfg, oracle, s, test.initialSets[i], 1, t.Name())
 		test.procs = append(test.procs, proc)
 		i++
 	}
@@ -312,7 +313,7 @@ func TestRecvDelayedDishonest(t *testing.T) {
 	// create dishonest
 	dishonestFunc := func() {
 		s := sim.NewFaulty(true, 0, 10) // delay rcv
-		proc := createConsensusProcess(false, cfg, oracle, s, test.initialSets[i])
+		proc := createConsensusProcess(false, cfg, oracle, s, test.initialSets[i], 1, t.Name())
 		test.dishonest = append(test.dishonest, proc)
 		i++
 	}

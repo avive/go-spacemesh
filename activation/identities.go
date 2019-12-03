@@ -1,23 +1,23 @@
 package activation
 
 import (
-	"github.com/spacemeshos/go-spacemesh/common"
+	"github.com/spacemeshos/go-spacemesh/common/types"
+	"github.com/spacemeshos/go-spacemesh/common/util"
 	"github.com/spacemeshos/go-spacemesh/database"
-	"github.com/spacemeshos/go-spacemesh/types"
 	"github.com/spacemeshos/sha256-simd"
 )
 
 type IdentityStore struct {
 	//todo: think about whether we need one db or several
-	ids database.DB
+	ids database.Database
 }
 
-func NewIdentityStore(db database.DB) *IdentityStore {
+func NewIdentityStore(db database.Database) *IdentityStore {
 	return &IdentityStore{db}
 }
 
 func getKey(key string) [32]byte {
-	return sha256.Sum256(common.Hex2Bytes(key))
+	return sha256.Sum256(util.Hex2Bytes(key))
 }
 
 func (s *IdentityStore) StoreNodeIdentity(id types.NodeId) error {

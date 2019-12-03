@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	cfg "github.com/spacemeshos/go-spacemesh/config"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -13,6 +14,7 @@ var (
 func AddCommands(cmd *cobra.Command) {
 
 	/** ======================== BaseConfig Flags ========================== **/
+
 	cmd.PersistentFlags().StringVarP(&config.BaseConfig.ConfigFile,
 		"config", "c", config.BaseConfig.ConfigFile, "Set Load configuration from file")
 	cmd.PersistentFlags().StringVarP(&config.BaseConfig.DataDir, "data-folder", "d",
@@ -27,13 +29,43 @@ func AddCommands(cmd *cobra.Command) {
 		config.OracleServer, "The oracle server url. (temporary) ")
 	cmd.PersistentFlags().IntVar(&config.OracleServerWorldId, "oracle_server_worldid",
 		config.OracleServerWorldId, "The worldid to use with the oracle server (temporary) ")
+	cmd.PersistentFlags().StringVar(&config.PoETServer, "poet-server",
+		config.OracleServer, "The poet server url. (temporary) ")
 	cmd.PersistentFlags().StringVar(&config.GenesisTime, "genesis-time",
 		config.GenesisTime, "Time of the genesis layer in 2019-13-02T17:02:00+00:00 format")
 	cmd.PersistentFlags().IntVar(&config.LayerDurationSec, "layer-duration-sec",
 		config.LayerDurationSec, "Duration between layers in seconds")
 	cmd.PersistentFlags().IntVar(&config.LayerAvgSize, "layer-average-size",
-		config.LayerDurationSec, "Duration between layers in seconds")
+		config.LayerAvgSize, "Layer Avg size")
+	cmd.PersistentFlags().IntVar(&config.Hdist, "hdist",
+		config.Hdist, "hdist")
+	cmd.PersistentFlags().BoolVar(&config.StartMining, "start-mining",
+		config.StartMining, "start mining")
+
+	cmd.PersistentFlags().StringVar(&config.MemProfile, "mem-profile",
+		config.MemProfile, "output memory profiling stat to filename")
+	cmd.PersistentFlags().StringVar(&config.CpuProfile, "cpu-profile",
+		config.CpuProfile, "output cpu profiling stat to filename")
+	cmd.PersistentFlags().BoolVar(&config.PprofHttpServer, "pprof-server",
+		config.PprofHttpServer, "enable http pprof server")
+	cmd.PersistentFlags().StringVar(&config.GenesisConfPath, "genesis-conf",
+		config.GenesisConfPath, "add genesis configuration")
+	cmd.PersistentFlags().StringVar(&config.CoinbaseAccount, "coinbase",
+		config.CoinbaseAccount, "coinbase account to accumulate rewards")
+
+	cmd.PersistentFlags().IntVar(&config.GenesisActiveSet, "genesis-active-size",
+		config.GenesisActiveSet, "The active set size for the genesis flow")
+	cmd.PersistentFlags().StringVar(&config.PublishEventsUrl, "events-url",
+		config.PublishEventsUrl, "publish events on this url, if no url specified event will no be published")
+
+	cmd.PersistentFlags().IntVar(&config.SyncRequestTimeout, "sync-request-timeout",
+		2000, "the timeout in ms for direct requests in the sync")
+
+	cmd.PersistentFlags().IntVar(&config.AtxsPerBlock, "atxs-per-block",
+		100, "the number of atxs to select per block on block creation")
+
 	/** ======================== P2P Flags ========================== **/
+
 	cmd.PersistentFlags().IntVar(&config.P2P.TCPPort, "tcp-port",
 		config.P2P.TCPPort, "TCP Port to listen on")
 	cmd.PersistentFlags().DurationVar(&config.P2P.DialTimeout, "dial-timeout",
@@ -72,14 +104,19 @@ func AddCommands(cmd *cobra.Command) {
 		config.P2P.SwarmConfig.BootstrapNodes, "Number of random connections")
 	cmd.PersistentFlags().DurationVar(&config.TIME.MaxAllowedDrift, "max-allowed-time-drift",
 		config.TIME.MaxAllowedDrift, "When to close the app until user resolves time sync problems")
+	cmd.PersistentFlags().StringVar(&config.P2P.SwarmConfig.PeersFile, "peers-file",
+		config.P2P.SwarmConfig.PeersFile, "addrbook peers file. located under data-dir/<publickey>/<peer-file> not loaded or saved if empty string is given.")
 	cmd.PersistentFlags().IntVar(&config.TIME.NtpQueries, "ntp-queries",
 		config.TIME.NtpQueries, "Number of ntp queries to do")
 	cmd.PersistentFlags().DurationVar(&config.TIME.DefaultTimeoutLatency, "default-timeout-latency",
 		config.TIME.DefaultTimeoutLatency, "Default timeout to ntp query")
 	cmd.PersistentFlags().DurationVar(&config.TIME.RefreshNtpInterval, "refresh-ntp-interval",
 		config.TIME.RefreshNtpInterval, "Refresh intervals to ntp")
+	cmd.PersistentFlags().IntVar(&config.P2P.MsgSizeLimit, "msg-size-limit",
+		config.P2P.MsgSizeLimit, "The message size limit in bytes for incoming messages")
 
 	/** ======================== API Flags ========================== **/
+
 	// StartJSONApiServerFlag determines if json api server should be started
 	cmd.PersistentFlags().BoolVar(&config.API.StartJSONServer, "json-server",
 		config.API.StartJSONServer, "StartService the json http server. "+
@@ -95,7 +132,7 @@ func AddCommands(cmd *cobra.Command) {
 	cmd.PersistentFlags().IntVar(&config.API.GrpcServerPort, "grpc-port",
 		config.API.GrpcServerPort, "GRPC api server port")
 
-	/**========================Hare Flags ========================== **/
+	/**======================== Hare Flags ========================== **/
 
 	// N determines the size of the hare committee
 	cmd.PersistentFlags().IntVar(&config.HARE.N, "hare-committee-size",
@@ -106,11 +143,54 @@ func AddCommands(cmd *cobra.Command) {
 	// RoundDuration determines the duration of a round in the Hare protocol
 	cmd.PersistentFlags().IntVar(&config.HARE.RoundDuration, "hare-round-duration-sec",
 		config.HARE.RoundDuration, "Duration of round in the Hare protocol")
+	cmd.PersistentFlags().IntVar(&config.HARE.WakeupDelta, "hare-wakeup-delta",
+		config.HARE.WakeupDelta, "Wakeup delta after tick for hare protocol")
+	cmd.PersistentFlags().IntVar(&config.HARE.ExpectedLeaders, "hare-exp-leaders",
+		config.HARE.ExpectedLeaders, "The expected number of leaders in the hare protocol")
+	cmd.PersistentFlags().IntVar(&config.HARE.LimitIterations, "hare-limit-iterations",
+		config.HARE.LimitIterations, "The limit of the number of iteration per consensus process")
+	cmd.PersistentFlags().IntVar(&config.HARE.LimitConcurrent, "hare-limit-concurrent",
+		config.HARE.LimitConcurrent, "The number of consensus processes running concurrently")
+
+	/**======================== Hare Eligibility Oracle Flags ========================== **/
+
+	cmd.PersistentFlags().Uint64Var(&config.HareEligibility.ConfidenceParam, "eligibility-confidence-param",
+		config.HareEligibility.ConfidenceParam, "The relative layer (with respect to the current layer) we are confident to have consensus about")
+	cmd.PersistentFlags().IntVar(&config.HareEligibility.EpochOffset, "eligibility-epoch-offset",
+		config.HareEligibility.EpochOffset, "The constant layer (within an epoch) for which we traverse its view for the purpose of counting consensus active set")
+
+	/**======================== PoST Flags ========================== **/
+
+	cmd.PersistentFlags().StringVar(&config.POST.DataDir, "post-datadir",
+		config.POST.DataDir, "The directory that contains post data files")
+	cmd.PersistentFlags().Uint64Var(&config.POST.SpacePerUnit, "post-space",
+		config.POST.SpacePerUnit, "Space per unit, in bytes")
+	cmd.PersistentFlags().IntVar(&config.POST.NumFiles, "post-numfiles",
+		config.POST.NumFiles, "Number of files")
+	cmd.PersistentFlags().UintVar(&config.POST.Difficulty, "post-difficulty",
+		config.POST.Difficulty, "Computational cost of the initialization")
+	cmd.PersistentFlags().UintVar(&config.POST.NumProvenLabels, "post-labels",
+		config.POST.NumProvenLabels, "Number of labels to prove in non-interactive proof (security parameter)")
+	cmd.PersistentFlags().UintVar(&config.POST.LowestLayerToCacheDuringProofGeneration, "post-cachelayer",
+		config.POST.LowestLayerToCacheDuringProofGeneration, "Lowest layer to cache in-memory during proof generation (optimization parameter)")
+	cmd.PersistentFlags().Uint64Var(&config.POST.LabelsLogRate, "post-lograte",
+		config.POST.LabelsLogRate, "Labels construction progress log rate")
+	cmd.PersistentFlags().UintVar(&config.POST.MaxWriteFilesParallelism, "post-parallel-files",
+		config.POST.MaxWriteFilesParallelism, "Max degree of files write parallelism")
+	cmd.PersistentFlags().UintVar(&config.POST.MaxWriteInFileParallelism, "post-parallel-infile",
+		config.POST.MaxWriteInFileParallelism, "Max degree of cpu work parallelism per file write")
+	cmd.PersistentFlags().UintVar(&config.POST.MaxReadFilesParallelism, "post-parallel-read",
+		config.POST.MaxReadFilesParallelism, "Max degree of files read parallelism")
 
 	/**========================Consensus Flags ========================== **/
-	//todo: add this here
+
+	cmd.PersistentFlags().IntVar(&config.LayersPerEpoch, "layers-per-epoch",
+		config.LayersPerEpoch, "number of layers in epoch")
 
 	// Bind Flags to config
-	viper.BindPFlags(cmd.PersistentFlags())
+	err := viper.BindPFlags(cmd.PersistentFlags())
+	if err != nil {
+		fmt.Println("an error has occurred while binding flags:", err)
+	}
 
 }

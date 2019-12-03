@@ -1,74 +1,50 @@
 package sync
 
 import (
+	"github.com/spacemeshos/go-spacemesh/common/types"
+	"github.com/spacemeshos/go-spacemesh/config"
 	"github.com/spacemeshos/go-spacemesh/log"
-	"github.com/spacemeshos/go-spacemesh/mesh"
-	"github.com/spacemeshos/go-spacemesh/p2p"
-	"github.com/spacemeshos/go-spacemesh/p2p/config"
-	"github.com/spacemeshos/go-spacemesh/p2p/server"
 	"github.com/spacemeshos/go-spacemesh/p2p/service"
-	"github.com/spacemeshos/go-spacemesh/timesync"
-	"github.com/spacemeshos/go-spacemesh/types"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
-type MessageServer server.MessageServer
-
-const BlockProtocol = "/blocks/1.0/"
-const NewBlockProtocol = "newBlock"
-
 type BlockListener struct {
-	*server.MessageServer
-	p2p.Peers
-	*mesh.Mesh
+	*Syncer
 	BlockValidator
 	log.Log
+	wg                   sync.WaitGroup
 	bufferSize           int
 	semaphore            chan struct{}
-	unknownQueue         chan types.BlockID //todo consider benefits of changing to stack
 	receivedGossipBlocks chan service.GossipMessage
 	startLock            uint32
 	timeout              time.Duration
 	exit                 chan struct{}
-	tick                 chan types.LayerID
-}
-
-type TickProvider interface {
-	Subscribe() timesync.LayerTimer
 }
 
 func (bl *BlockListener) Close() {
-	bl.Peers.Close()
 	close(bl.exit)
+	bl.Info("block listener closing, waiting for gorutines")
+	bl.wg.Wait()
+	bl.Syncer.Close()
+	bl.Info("block listener closed")
 }
 
 func (bl *BlockListener) Start() {
 	if atomic.CompareAndSwapUint32(&bl.startLock, 0, 1) {
-		go bl.run()
 		go bl.ListenToGossipBlocks()
 	}
 }
 
-func (bl *BlockListener) OnNewBlock(b *types.Block) {
-	bl.addUnknownToQueue(b)
-}
-
-func NewBlockListener(net service.Service, bv BlockValidator, layers *mesh.Mesh, timeout time.Duration, concurrency int, logger log.Log) *BlockListener {
-
+func NewBlockListener(net service.Service, sync *Syncer, concurrency int, logger log.Log) *BlockListener {
 	bl := BlockListener{
-		BlockValidator:       bv,
-		Mesh:                 layers,
-		Peers:                p2p.NewPeers(net),
-		MessageServer:        server.NewMsgServer(net.(server.Service), BlockProtocol, timeout, make(chan service.DirectMessage, config.ConfigValues.BufferSize), logger),
+		Syncer:               sync,
 		Log:                  logger,
 		semaphore:            make(chan struct{}, concurrency),
-		unknownQueue:         make(chan types.BlockID, 200), //todo tune buffer size + get buffer from config
 		exit:                 make(chan struct{}),
-		receivedGossipBlocks: net.RegisterGossipProtocol(NewBlockProtocol),
+		receivedGossipBlocks: net.RegisterGossipProtocol(config.NewBlockProtocol),
 	}
-	bl.RegisterBytesMsgHandler(BLOCK, newBlockRequestHandler(layers, logger))
-
 	return &bl
 }
 
@@ -79,83 +55,57 @@ func (bl *BlockListener) ListenToGossipBlocks() {
 			bl.Log.Info("listening  stopped")
 			return
 		case data := <-bl.receivedGossipBlocks:
-
-			if data == nil {
-				bl.Error("got empty message while listening to gossip blocks")
+			if !bl.ListenToGossip() {
+				bl.With().Info("ignoring gossip blocks - not synced yet")
 				break
 			}
 
-			blk, err := types.BytesAsBlock(data.Bytes())
-			if err != nil {
-				bl.Error("received invalid block %v", data.Bytes()[:7])
-				break
-			}
-
-			bl.Log.With().Info("got new block", log.Uint64("id", uint64(blk.Id)), log.Int("txs", len(blk.Txs)))
-			eligible, err := bl.BlockEligible(&blk)
-			if err != nil {
-				bl.Error("block eligible check failed")
-				break
-			}
-			if !eligible {
-				bl.Error("block not eligible")
-				break
-			}
-
-			if err := bl.AddBlock(&blk); err != nil {
-				bl.Info("Block already received")
-				break
-			}
-			bl.Info("added block to database ")
-			data.ReportValidation(NewBlockProtocol)
-			bl.addUnknownToQueue(&blk)
-		}
-	}
-}
-
-func (bl *BlockListener) run() {
-	for {
-		select {
-		case <-bl.exit:
-			bl.Log.Info("run stopped")
-			return
-		case id := <-bl.unknownQueue:
-			bl.Log.Debug("fetch block ", id, "buffer is at ", len(bl.unknownQueue)/cap(bl.unknownQueue), " capacity")
-			bl.semaphore <- struct{}{}
+			bl.wg.Add(1)
 			go func() {
-				bl.FetchBlock(id)
-				<-bl.semaphore
+				defer bl.wg.Done()
+				if data == nil {
+					bl.Error("got empty message while listening to gossip blocks")
+					return
+				}
+
+				bl.handleBlock(data)
+
 			}()
+
 		}
 	}
 }
 
-//todo handle case where no peer knows the block
-func (bl *BlockListener) FetchBlock(id types.BlockID) {
-	for _, p := range bl.GetPeers() {
-		if ch, err := sendBlockRequest(bl.MessageServer, p, id, bl.Log); err == nil {
-			block := <-ch
-			if block == nil {
-				continue
-			}
-			eligible, err := bl.BlockEligible(block)
-			if err != nil {
-				panic("return error!") // TODO: return error
-			}
-			if eligible {
-				bl.AddBlock(block)
-				bl.addUnknownToQueue(block) //add all child blocks to unknown queue
-				return
-			}
-		}
+func (bl *BlockListener) handleBlock(data service.GossipMessage) {
+	var blk types.Block
+	err := types.BytesToInterface(data.Bytes(), &blk)
+	if err != nil {
+		bl.Error("received invalid block %v", data.Bytes(), err)
+		return
 	}
-}
 
-func (bl *BlockListener) addUnknownToQueue(b *types.Block) {
-	for _, block := range b.ViewEdges {
-		//if unknown block
-		if _, err := bl.GetBlock(block); err != nil {
-			bl.unknownQueue <- block
-		}
+	//set the block id when received
+	blk.CalcAndSetId()
+
+	bl.Log.With().Info("got new block", log.BlockId(blk.Id().String()), log.LayerId(uint64(blk.Layer())), log.Int("txs", len(blk.TxIds)), log.Int("atxs", len(blk.AtxIds)))
+	//check if known
+	if _, err := bl.GetBlock(blk.Id()); err == nil {
+		bl.With().Info("we already know this block", log.BlockId(blk.Id().String()))
+		return
 	}
+	txs, atxs, err := bl.blockSyntacticValidation(&blk)
+	if err != nil {
+		bl.With().Error("failed to validate block", log.BlockId(blk.Id().String()), log.Err(err))
+		return
+	}
+	data.ReportValidation(config.NewBlockProtocol)
+	if err := bl.AddBlockWithTxs(&blk, txs, atxs); err != nil {
+		bl.With().Error("failed to add block to database", log.BlockId(blk.Id().String()), log.Err(err))
+		return
+	}
+
+	if blk.Layer() <= bl.ValidatedLayer() {
+		bl.Syncer.HandleLateBlock(&blk)
+	}
+	return
 }

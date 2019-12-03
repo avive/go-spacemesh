@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"golang.org/x/sync/errgroup"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -58,6 +59,19 @@ func (its *IntegrationTestSuite) SetupSuite() {
 			its.AfterHook(i, boot[i])
 		}
 		testLog("BOOTNODE : %v", boot[i].LocalNode().String())
+	}
+
+	for i := 0; i < len(boot); i++ {
+		for j := 0; j < len(boot); j++ {
+			if j == i {
+				continue
+			}
+			udpAddr := boot[j].udpnetwork.LocalAddr().(*net.UDPAddr)
+			tcpAddr := boot[j].network.LocalAddr().(*net.TCPAddr)
+			pk := boot[j].lNode.PublicKey()
+			info := node.NewNode(pk, tcpAddr.IP, uint16(tcpAddr.Port), uint16(udpAddr.Port))
+			boot[i].discover.Update(info, info)
+		}
 	}
 
 	cfg := config.DefaultConfig()
@@ -205,8 +219,11 @@ func Errors(arr []error) []int {
 func StringIdentifiers(boot ...*swarm) []string {
 	s := make([]string, len(boot))
 	for i := 0; i < len(s); i++ {
-		s[i] = node.StringFromNode(node.New(boot[i].LocalNode().Node.PublicKey(), boot[i].udpnetwork.LocalAddr().String()))
+		pk := boot[i].LocalNode().PublicKey()
+		udp := boot[i].udpnetwork.LocalAddr().(*net.UDPAddr)
+		tcp := boot[i].network.LocalAddr().(*net.TCPAddr)
+		nodeinfo := node.NewNode(pk, net.IPv6loopback, uint16(tcp.Port), uint16(udp.Port))
+		s[i] = nodeinfo.String() //node.StringFromNode(node.New(boot[i].LocalNode().Node.PublicKey(), boot[i].udpnetwork.LocalAddr().String())) )
 	}
-
 	return s
 }

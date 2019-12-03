@@ -4,131 +4,86 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"github.com/spacemeshos/go-spacemesh/types"
+	"github.com/spacemeshos/go-spacemesh/common/types"
 	"hash/fnv"
 	"sort"
-	"strconv"
 )
 
-type Bytes32 [32]byte
-type Signature []byte
+type instanceId types.LayerID
 
-type Value struct {
-	types.BlockID
-}
-type InstanceId types.LayerID
+type messageType byte
 
-type MessageType byte
-
+// declare all known message types
 const (
-	Status   MessageType = 0
-	Proposal MessageType = 1
-	Commit   MessageType = 2
-	Notify   MessageType = 3
-	PreRound MessageType = 10
+	status   messageType = 0
+	proposal messageType = 1
+	commit   messageType = 2
+	notify   messageType = 3
+	pre      messageType = 10
 )
 
+// declare round identifiers
 const (
-	Round1 = 0
-	Round2 = 1
-	Round3 = 2
-	Round4 = 3
+	preRound      = -1
+	statusRound   = 0
+	proposalRound = 1
+	commitRound   = 2
+	notifyRound   = 3
 )
 
 const defaultSetSize = 200
 
-func (mType MessageType) String() string {
+func (mType messageType) String() string {
 	switch mType {
-	case Status:
+	case status:
 		return "Status"
-	case Proposal:
+	case proposal:
 		return "Proposal"
-	case Commit:
+	case commit:
 		return "Commit"
-	case Notify:
+	case notify:
 		return "Notify"
-	case PreRound:
+	case pre:
 		return "PreRound"
 	default:
 		return "Unknown message type"
 	}
 }
 
-func (id InstanceId) Bytes() []byte {
+func (id instanceId) Bytes() []byte {
 	idInBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(idInBytes, uint32(id))
 
 	return idInBytes
 }
 
-func NewValue(value uint64) Value {
-	return Value{types.BlockID(value)}
-}
-
-func (v Value) Id() objectId {
-	return objectId(v.BlockID)
-
-}
-
-func (v Value) Bytes() []byte {
-	b := make([]byte, 8)
-	binary.LittleEndian.PutUint64(b, uint64(v.BlockID))
-	return b
-}
-
-func (v Value) String() string {
-	return strconv.FormatUint(uint64(v.BlockID), 10)
-
-}
-
-func NewBytes32(buff []byte) Bytes32 {
-	x := Bytes32{}
-	copy(x[:], buff)
-
-	return x
-}
-
-func (b32 Bytes32) Id() objectId {
-	h := fnv.New32()
-	h.Write(b32[:])
-	return objectId(h.Sum32())
-}
-
-func (b32 Bytes32) Bytes() []byte {
-	return b32[:]
-}
-
-func (b32 Bytes32) String() string {
-	// TODO: should improve
-	return string(b32.Id())
-}
-
-// Represents a unique set of Values
+// Set represents a unique set of values.
 type Set struct {
-	values    map[objectId]Value
+	values    map[types.BlockID]struct{}
 	id        objectId
 	isIdValid bool
 }
 
-// Constructs an empty set
-func NewSmallEmptySet() *Set {
+// NewDefaultEmptySet creates an empty set with the default size.
+func NewDefaultEmptySet() *Set {
 	return NewEmptySet(defaultSetSize)
 }
 
-// Constructs an empty set
-func NewEmptySet(expectedSize int) *Set {
+// NewEmptySet creates an empty set with the provided size.
+func NewEmptySet(size int) *Set {
 	s := &Set{}
-	s.values = make(map[objectId]Value, expectedSize)
+	s.values = make(map[types.BlockID]struct{}, size)
 	s.id = 0
 	s.isIdValid = false
 
 	return s
 }
 
-// Constructs an empty set
-func NewSetFromValues(values ...Value) *Set {
+// NewSetFromValues creates a set of the provided values.
+// Note: duplicated values are ignored.
+func NewSetFromValues(values ...types.BlockID) *Set {
 	s := &Set{}
-	s.values = make(map[objectId]Value, len(values))
+	s.values = make(map[types.BlockID]struct{}, len(values))
 	for _, v := range values {
 		s.Add(v)
 	}
@@ -138,65 +93,66 @@ func NewSetFromValues(values ...Value) *Set {
 	return s
 }
 
-// Constructs a new set from a 2D slice
-// Each row represents a single value
-func NewSet(data []uint64) *Set {
+// NewSet creates a set from the provided array of values.
+// Note: duplicated values are ignored.
+func NewSet(data []types.BlockID) *Set {
 	s := &Set{}
 	s.isIdValid = false
 
-	s.values = make(map[objectId]Value, len(data))
-	for i := 0; i < len(data); i++ {
-		bid := data[i]
-		s.values[objectId(bid)] = NewValue(bid)
+	s.values = make(map[types.BlockID]struct{}, len(data))
+	for _, bid := range data {
+		s.values[bid] = struct{}{}
 	}
 
 	return s
 }
 
-// Clones the set
+// Clone creates a copy of the set.
 func (s *Set) Clone() *Set {
 	clone := NewEmptySet(len(s.values))
-	for _, v := range s.values {
-		clone.Add(v)
+	for bid := range s.values {
+		clone.Add(bid)
 	}
 
 	return clone
 }
 
-// Checks if a value is contained in the  set s
-func (s *Set) Contains(id Value) bool {
-	_, exist := s.values[id.Id()]
+// Contains returns true if the provided value is contained in the set, false otherwise.
+func (s *Set) Contains(id types.BlockID) bool {
+	_, exist := s.values[id]
 	return exist
 }
 
-// Adds a value to the set if it doesn't exist already
-func (s *Set) Add(id Value) {
-	if _, exist := s.values[id.Id()]; exist {
+// Add a value to the set.
+// It has no effect if the value already exists in the set.
+func (s *Set) Add(id types.BlockID) {
+	if _, exist := s.values[id]; exist {
 		return
 	}
 
 	s.isIdValid = false
-	s.values[id.Id()] = id
+	s.values[id] = struct{}{}
 }
 
-// Removes a value from the set if exist
-func (s *Set) Remove(id Value) {
-	if _, exist := s.values[id.Id()]; !exist {
+// Remove a value from the set.
+// It has no effect if the value doesn't exist in the set.
+func (s *Set) Remove(id types.BlockID) {
+	if _, exist := s.values[id]; !exist {
 		return
 	}
 
 	s.isIdValid = false
-	delete(s.values, id.Id())
+	delete(s.values, id)
 }
 
-// Returns true if s and g represents the same set, false otherwise
+// Equals returns true if the provided set represents this set, false otherwise.
 func (s *Set) Equals(g *Set) bool {
 	if len(s.values) != len(g.values) {
 		return false
 	}
 
-	for _, bid := range s.values {
-		if _, exist := g.values[bid.Id()]; !exist {
+	for bid := range s.values {
+		if _, exist := g.values[bid]; !exist {
 			return false
 		}
 	}
@@ -204,28 +160,38 @@ func (s *Set) Equals(g *Set) bool {
 	return true
 }
 
-func (s *Set) To2DSlice() []uint64 {
-	l := make([]uint64, 0, len(s.values))
-	for _, v := range s.values {
-		l = append(l, uint64(v.BlockID))
+// ToSlice returns the array representation of the set.
+func (s *Set) ToSlice() []types.BlockID {
+	// order keys
+	keys := make([]types.BlockID, len(s.values))
+	i := 0
+	for k := range s.values {
+		keys[i] = k
+		i++
+	}
+	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i].ToBytes(), keys[j].ToBytes()) == -1 })
+
+	l := make([]types.BlockID, 0, len(s.values))
+	for i := range keys {
+		l = append(l, keys[i])
 	}
 	return l
 }
 
 func (s *Set) updateId() {
 	// order keys
-	keys := make([]objectId, len(s.values))
+	keys := make([]types.BlockID, len(s.values))
 	i := 0
 	for k := range s.values {
 		keys[i] = k
 		i++
 	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i].ToBytes(), keys[j].ToBytes()) == -1 })
 
 	// calc
 	h := fnv.New32()
 	for i := 0; i < len(keys); i++ {
-		h.Write(s.values[keys[i]].Bytes())
+		h.Write(keys[i].ToBytes())
 	}
 
 	// update
@@ -233,7 +199,7 @@ func (s *Set) updateId() {
 	s.isIdValid = true
 }
 
-// Returns the objectId of the set
+// Id returns the objectId of the set.
 func (s *Set) Id() objectId {
 	if !s.isIdValid {
 		s.updateId()
@@ -245,8 +211,8 @@ func (s *Set) Id() objectId {
 func (s *Set) String() string {
 	// TODO: should improve
 	b := new(bytes.Buffer)
-	for _, v := range s.values {
-		fmt.Fprintf(b, "%v,", v.Id())
+	for v := range s.values {
+		fmt.Fprintf(b, "%v,", v.String())
 	}
 	if b.Len() >= 1 {
 		return b.String()[:b.Len()-1]
@@ -254,9 +220,9 @@ func (s *Set) String() string {
 	return b.String()
 }
 
-// Check if s is a subset of g
+// IsSubSetOf returns true if s is a subset of g, false otherwise.
 func (s *Set) IsSubSetOf(g *Set) bool {
-	for _, v := range s.values {
+	for v := range s.values {
 		if !g.Contains(v) {
 			return false
 		}
@@ -265,10 +231,10 @@ func (s *Set) IsSubSetOf(g *Set) bool {
 	return true
 }
 
-// Returns the intersection set of s and g
+// Intersection returns the intersection a new set which represents the intersection of s and g.
 func (s *Set) Intersection(g *Set) *Set {
 	both := NewEmptySet(len(s.values))
-	for _, v := range s.values {
+	for v := range s.values {
 		if g.Contains(v) {
 			both.Add(v)
 		}
@@ -277,25 +243,25 @@ func (s *Set) Intersection(g *Set) *Set {
 	return both
 }
 
-// Returns the union set of s and g
+// Union returns a new set which represetns the union set of s and g.
 func (s *Set) Union(g *Set) *Set {
 	union := NewEmptySet(len(s.values) + len(g.values))
 
-	for _, v := range s.values {
+	for v := range s.values {
 		union.Add(v)
 	}
 
-	for _, v := range g.values {
+	for v := range g.values {
 		union.Add(v)
 	}
 
 	return union
 }
 
-// Returns the complement of s relatively to the world u
+// Complement returns a new set that represents the complement of s relatively to the world u.
 func (s *Set) Complement(u *Set) *Set {
 	comp := NewEmptySet(len(u.values))
-	for _, v := range u.values {
+	for v := range u.values {
 		if !s.Contains(v) {
 			comp.Add(v)
 		}
@@ -304,14 +270,14 @@ func (s *Set) Complement(u *Set) *Set {
 	return comp
 }
 
-// Subtract g from s
+// Subtract g from s.
 func (s *Set) Subtract(g *Set) {
-	for _, v := range g.values {
+	for v := range g.values {
 		s.Remove(v)
 	}
 }
 
-// Returns the size of the set
+// Size returns the number of elements in the set.
 func (s *Set) Size() int {
 	return len(s.values)
 }

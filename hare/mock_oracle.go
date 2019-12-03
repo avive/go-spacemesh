@@ -1,67 +1,17 @@
 package hare
 
 import (
-	"encoding/binary"
+	"errors"
+	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/spacemeshos/go-spacemesh/log"
 	"hash/fnv"
 	"math"
 	"sync"
 )
 
-type Role byte
-
-const (
-	Passive = Role(0)
-	Active  = Role(1)
-	Leader  = Role(2)
-)
-
-type Stringer interface {
-	String() string
-}
-
-type Registrable interface {
+type registrable interface {
 	Register(isHonest bool, id string)
 	Unregister(isHonest bool, id string)
-}
-
-type Rolacle interface {
-	Eligible(instanceID uint32, committeeSize int, pubKey string, proof []byte) bool
-}
-
-type HareRolacle interface {
-	Eligible(instanceId InstanceId, k int32, pubKey string, proof []byte) bool
-}
-
-type hareRolacle struct {
-	oracle        Rolacle
-	committeeSize int
-}
-
-func NewHareOracle(oracle Rolacle, committeeSize int) *hareRolacle {
-	return &hareRolacle{oracle, committeeSize}
-}
-
-func (hr *hareRolacle) Eligible(instanceId InstanceId, k int32, pubKey string, proof []byte) bool {
-	return hr.oracle.Eligible(hashInstanceAndK(instanceId, k), expectedCommitteeSize(k, hr.committeeSize), pubKey, proof)
-}
-
-func hashInstanceAndK(instanceID InstanceId, K int32) uint32 {
-	kInBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(kInBytes, uint32(K))
-	h := newHasherU32()
-	val := h.Hash(instanceID.Bytes(), kInBytes)
-	return val
-}
-
-// Returns the expected committee size for the given round assuming n is the default size
-func expectedCommitteeSize(k int32, n int) int {
-	if k%4 == Round2 {
-		return 1 // 1 leader
-	}
-
-	// N actives in any other case
-	return n
 }
 
 type hasherU32 struct {
@@ -85,44 +35,47 @@ func (h *hasherU32) MaxValue() uint32 {
 	return math.MaxUint32
 }
 
-type MockHashOracle struct {
+type mockHashOracle struct {
 	clients map[string]struct{}
 	mutex   sync.RWMutex
 	hasher  *hasherU32
 }
 
-// N is the expected comity size
-func NewMockHashOracle(expectedSize int) *MockHashOracle {
-	mock := new(MockHashOracle)
+func (mho *mockHashOracle) IsIdentityActiveOnConsensusView(edId string, layer types.LayerID) (bool, error) {
+	return true, nil
+}
+
+func newMockHashOracle(expectedSize int) *mockHashOracle {
+	mock := new(mockHashOracle)
 	mock.clients = make(map[string]struct{}, expectedSize)
 	mock.hasher = newHasherU32()
 
 	return mock
 }
 
-func (mock *MockHashOracle) Register(client string) {
-	mock.mutex.Lock()
+func (mho *mockHashOracle) Register(client string) {
+	mho.mutex.Lock()
 
-	if _, exist := mock.clients[client]; exist {
-		mock.mutex.Unlock()
+	if _, exist := mho.clients[client]; exist {
+		mho.mutex.Unlock()
 		return
 	}
 
-	mock.clients[client] = struct{}{}
-	mock.mutex.Unlock()
+	mho.clients[client] = struct{}{}
+	mho.mutex.Unlock()
 }
 
-func (mock *MockHashOracle) Unregister(client string) {
-	mock.mutex.Lock()
-	delete(mock.clients, client)
-	mock.mutex.Unlock()
+func (mho *mockHashOracle) Unregister(client string) {
+	mho.mutex.Lock()
+	delete(mho.clients, client)
+	mho.mutex.Unlock()
 }
 
 // Calculates the threshold for the given committee size
-func (mock *MockHashOracle) calcThreshold(committeeSize int) uint32 {
-	mock.mutex.RLock()
-	numClients := len(mock.clients)
-	mock.mutex.RUnlock()
+func (mho *mockHashOracle) calcThreshold(committeeSize int) uint32 {
+	mho.mutex.RLock()
+	numClients := len(mho.clients)
+	mho.mutex.RUnlock()
 
 	if numClients == 0 {
 		log.Error("Called calcThreshold with 0 clients registered")
@@ -135,21 +88,25 @@ func (mock *MockHashOracle) calcThreshold(committeeSize int) uint32 {
 		return 0
 	}
 
-	return uint32(uint64(committeeSize) * uint64(mock.hasher.MaxValue()) / uint64(numClients))
+	return uint32(uint64(committeeSize) * uint64(mho.hasher.MaxValue()) / uint64(numClients))
 }
 
 // Eligible if a proof is valid for a given committee size
-func (mock *MockHashOracle) Eligible(instanceID uint32, committeeSize int, pubKey string, proof []byte) bool {
-	if proof == nil {
+func (mho *mockHashOracle) Eligible(layer types.LayerID, round int32, committeeSize int, id types.NodeId, sig []byte) (bool, error) {
+	if sig == nil {
 		log.Warning("Oracle query with proof=nil. Returning false")
-		return false
+		return false, errors.New("sig is nil")
 	}
 
 	// calculate hash of proof
-	proofHash := mock.hasher.Hash(proof)
-	if proofHash <= mock.calcThreshold(committeeSize) { // check threshold
-		return true
+	proofHash := mho.hasher.Hash(sig)
+	if proofHash <= mho.calcThreshold(committeeSize) { // check threshold
+		return true, nil
 	}
 
-	return false
+	return false, nil
+}
+
+func (mho *mockHashOracle) Proof(layer types.LayerID, round int32) ([]byte, error) {
+	return []byte{}, nil
 }

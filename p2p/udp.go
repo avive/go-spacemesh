@@ -3,32 +3,28 @@ package p2p
 import (
 	"errors"
 	"fmt"
+	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/spacemeshos/go-spacemesh/p2p/config"
 	"github.com/spacemeshos/go-spacemesh/p2p/version"
 	"net"
+	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/spacemeshos/go-spacemesh/log"
 	inet "github.com/spacemeshos/go-spacemesh/p2p/net"
 	"github.com/spacemeshos/go-spacemesh/p2p/node"
 	"github.com/spacemeshos/go-spacemesh/p2p/p2pcrypto"
-	"github.com/spacemeshos/go-spacemesh/p2p/pb"
 	"github.com/spacemeshos/go-spacemesh/p2p/service"
 )
 
-const maxMessageSize = 2048
-
-// todo : calculate real udp max message size
-
 // Lookuper is a service used to lookup for nodes we know already
-type Lookuper func(key p2pcrypto.PublicKey) (node.Node, error)
+type Lookuper func(key p2pcrypto.PublicKey) (*node.NodeInfo, error)
 
 type udpNetwork interface {
 	Start() error
 	Shutdown()
 
 	IncomingMessages() chan inet.UDPMessageEvent
-	Send(to node.Node, data []byte) error
+	Send(to *node.NodeInfo, data []byte) error
 }
 
 // UDPMux is a server for receiving and sending udp messages. through protocols.
@@ -123,7 +119,7 @@ func (mux *UDPMux) SendMessage(peerPubkey p2pcrypto.PublicKey, protocol string, 
 // sendMessageImpl finds the peer address, wraps the message as a protocol message with p2p metadata and sends it.
 func (mux *UDPMux) sendMessageImpl(peerPubkey p2pcrypto.PublicKey, protocol string, payload service.Data) error {
 	var err error
-	var peer node.Node
+	var peer *node.NodeInfo
 
 	peer, err = mux.lookuper(peerPubkey)
 
@@ -133,28 +129,31 @@ func (mux *UDPMux) sendMessageImpl(peerPubkey p2pcrypto.PublicKey, protocol stri
 
 	//todo: Session (maybe use cpool ?)
 
-	protomessage := &pb.UDPProtocolMessage{
-		Metadata: pb.NewUDPProtocolMessageMetadata(mux.local.PublicKey(), mux.local.NetworkID(), protocol), // todo : config
+	mt := ProtocolMessageMetadata{protocol,
+		config.ClientVersion,
+		time.Now().UnixNano(),
+		mux.local.PublicKey().Bytes(),
+		int32(mux.local.NetworkID()),
 	}
 
-	realpayload, err := pb.CreatePayload(payload)
+	message := ProtocolMessage{
+		Metadata: &mt,
+	}
+
+	message.Payload, err = CreatePayload(payload)
 	if err != nil {
-		return fmt.Errorf("can't create payload from message %v", err)
+		return fmt.Errorf("can't create payload, err:%v", err)
 	}
 
-	protomessage.Payload = realpayload
-
-	data, err := proto.Marshal(protomessage)
+	data, err := types.InterfaceToBytes(&message)
 	if err != nil {
 		return fmt.Errorf("failed to encode signed message err: %v", err)
 	}
 
-	if len(data) > maxMessageSize {
-		return errors.New(fmt.Sprintf("message too big (%v bytes). max allowed size = %d bytes", len(data), maxMessageSize))
-	}
-
 	// TODO: node.address should have IP address, UDP and TCP PORT.
 	// 		 for now assuming it's the same port for both.
+
+	mux.logger.Debug("Sending udp message to %v, %v", peer.String())
 
 	return mux.network.Send(peer, data)
 }
@@ -183,8 +182,9 @@ func (upm *udpProtocolMessage) Data() service.Data {
 
 // processUDPMessage processes a udp message received and passes it to the protocol, it adds related p2p metadata.
 func (mux *UDPMux) processUDPMessage(sender p2pcrypto.PublicKey, fromaddr net.Addr, buf []byte) error {
-	msg := &pb.UDPProtocolMessage{}
-	err := proto.Unmarshal(buf, msg)
+	mux.logger.Debug("Processing message from %v, %v, len:%v", sender.String(), fromaddr.String(), len(buf))
+	msg := &ProtocolMessage{}
+	err := types.BytesToInterface(buf, msg)
 	if err != nil {
 		return errors.New("could'nt deserialize message")
 	}
@@ -200,10 +200,10 @@ func (mux *UDPMux) processUDPMessage(sender p2pcrypto.PublicKey, fromaddr net.Ad
 
 	var data service.Data
 
-	data, err = pb.ExtractData(msg.Payload)
+	data, err = ExtractData(msg.Payload)
 
 	if err != nil {
-		return err
+		return fmt.Errorf("failed extracting data from message err:%v", err)
 	}
 
 	p2pmeta := service.P2PMetadata{fromaddr}

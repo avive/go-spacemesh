@@ -1,7 +1,10 @@
 package eligibility
 
 import (
+	"encoding/binary"
+	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/spacemeshos/go-spacemesh/log"
+	"hash/fnv"
 	"sync"
 )
 
@@ -22,6 +25,10 @@ func New() *FixedRolacle {
 	return rolacle
 }
 
+func (fo *FixedRolacle) IsIdentityActiveOnConsensusView(edId string, layer types.LayerID) (bool, error) {
+	return true, nil
+}
+
 func (fo *FixedRolacle) Export(id uint32, committeeSize int) map[string]struct{} {
 	fo.mapRW.RLock()
 	total := len(fo.honest) + len(fo.faulty)
@@ -30,7 +37,7 @@ func (fo *FixedRolacle) Export(id uint32, committeeSize int) map[string]struct{}
 	// normalize committee size
 	size := committeeSize
 	if committeeSize > total {
-		log.Error("committee size bigger than the number of clients. Expected %v<=%v", committeeSize, total)
+		log.Warning("committee size bigger than the number of clients. Expected %v<=%v", committeeSize, total)
 		size = total
 	}
 
@@ -107,7 +114,7 @@ func (fo *FixedRolacle) generateEligibility(expCom int) map[string]struct{} {
 
 	expHonest := expCom/2 + 1
 	if expHonest > len(fo.honest) {
-		log.Error("Not enough registered honest. Expected %v<=%v", expHonest, len(fo.honest))
+		log.Warning("Not enough registered honest. Expected %v<=%v", expHonest, len(fo.honest))
 		expHonest = len(fo.honest)
 	}
 
@@ -117,9 +124,9 @@ func (fo *FixedRolacle) generateEligibility(expCom int) map[string]struct{} {
 	expFaulty := expCom - expHonest
 	if expFaulty > len(fo.faulty) {
 		if len(fo.faulty) > 0 { // not enough
-			log.Warning("Not enough registered dishonest to pick from. Expected %v<=%v. Picking %v instead", expFaulty, len(fo.faulty), len(fo.faulty))
+			log.Debug("Not enough registered dishonest to pick from. Expected %v<=%v. Picking %v instead", expFaulty, len(fo.faulty), len(fo.faulty))
 		} else { // no faulty at all - acceptable
-			log.Info("No registered dishonest to pick from. Picking honest instead")
+			log.Debug("No registered dishonest to pick from. Picking honest instead")
 		}
 		expFaulty = len(fo.faulty)
 	}
@@ -137,26 +144,50 @@ func (fo *FixedRolacle) generateEligibility(expCom int) map[string]struct{} {
 	return emap
 }
 
-func (fo *FixedRolacle) Eligible(id uint32, committeeSize int, pubKey string, proof []byte) bool {
+func hashLayerAndRound(instanceID types.LayerID, round int32) uint32 {
+	kInBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(kInBytes, uint32(round))
+	h := fnv.New32()
+	h.Write(instanceID.ToBytes())
+	h.Write(kInBytes)
+
+	return h.Sum32()
+}
+
+func (fo *FixedRolacle) Eligible(layer types.LayerID, round int32, committeeSize int, id types.NodeId, sig []byte) (bool, error) {
 	fo.mapRW.RLock()
-	total := len(fo.honest) + len(fo.faulty)
+	total := len(fo.honest) + len(fo.faulty) // safe since len >= 0
 	fo.mapRW.RUnlock()
 
 	// normalize committee size
 	size := committeeSize
 	if committeeSize > total {
-		log.Error("committee size bigger than the number of clients. Expected %v<=%v", committeeSize, total)
+		log.Warning("committee size bigger than the number of clients. Expected %v<=%v", committeeSize, total)
 		size = total
 	}
 
+	instId := hashLayerAndRound(layer, round)
+
 	fo.mapRW.Lock()
 	// generate if not exist for the requested K
-	if _, exist := fo.emaps[id]; !exist {
-		fo.emaps[id] = fo.generateEligibility(size)
+	if _, exist := fo.emaps[instId]; !exist {
+		fo.emaps[instId] = fo.generateEligibility(size)
 	}
 	fo.mapRW.Unlock()
 	// get eligibility result
-	_, exist := fo.emaps[id][pubKey]
+	_, exist := fo.emaps[instId][id.Key]
 
-	return exist
+	return exist, nil
+}
+
+func (fo *FixedRolacle) Proof(layer types.LayerID, round int32) ([]byte, error) {
+	kInBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(kInBytes, uint32(round))
+	hash := fnv.New32()
+	hash.Write(kInBytes)
+
+	hashBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(hashBytes, uint32(hash.Sum32()))
+
+	return hashBytes, nil
 }

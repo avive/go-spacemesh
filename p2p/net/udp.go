@@ -1,16 +1,17 @@
 package net
 
 import (
+	"github.com/spacemeshos/go-spacemesh/log"
 	"github.com/spacemeshos/go-spacemesh/p2p/p2pcrypto"
 	"net"
-
-	"github.com/spacemeshos/go-spacemesh/log"
 
 	"github.com/spacemeshos/go-spacemesh/p2p/config"
 	"github.com/spacemeshos/go-spacemesh/p2p/node"
 )
 
-const maxMessageSize = 2048
+// TODO: we should remove this const. Should  not depend on the number of addresses.
+// TODO: the number of addresses should be derived from the limit provided in the config
+const maxMessageSize = 300 * 60 // @see 0getAddrMax
 
 // UDPMessageEvent is an event about a udp message. passed through a channel
 type UDPMessageEvent struct {
@@ -33,15 +34,10 @@ type UDPNet struct {
 
 // NewUDPNet creates a UDPNet. returns error if the listening can't be resolved
 func NewUDPNet(config config.Config, local *node.LocalNode, log log.Log) (*UDPNet, error) {
-	addr, err := net.ResolveUDPAddr("udp", local.Address())
-	if err != nil {
-		return nil, err
-	}
-
 	n := &UDPNet{
 		local:      local,
 		logger:     log,
-		udpAddress: addr,
+		udpAddress: NodeAddr(local.NodeInfo),
 		config:     config,
 		msgChan:    make(chan UDPMessageEvent, config.BufferSize),
 		shutdown:   make(chan struct{}),
@@ -59,7 +55,7 @@ func (n *UDPNet) Start() error {
 		return err
 	}
 	n.conn = listener
-	n.logger.Info("Started listening on udp:%v", listener.LocalAddr().String())
+	n.logger.Info("Started UDP server listening for messages on udp:%v", listener.LocalAddr().String())
 	go n.listenToUDPNetworkMessages(listener)
 
 	return nil
@@ -84,10 +80,6 @@ func newUDPListener(listenAddress *net.UDPAddr) (*net.UDPConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = listen.SetReadBuffer(maxMessageSize)
-	if err != nil {
-		return nil, err
-	}
 	return listen, nil
 }
 
@@ -98,44 +90,23 @@ func (n *UDPNet) initSession(remote p2pcrypto.PublicKey) NetworkSession {
 	return session
 }
 
-// Send writes a udp packet to the target with the given data
-func (n *UDPNet) Send(to node.Node, data []byte) error {
+func NodeAddr(info *node.NodeInfo) *net.UDPAddr {
+	return &net.UDPAddr{IP: info.IP, Port: int(info.DiscoveryPort)}
+}
 
-	raddr, err := resolveUDPAddr(to.Address())
-	if err != nil {
-		return err
-	}
+// Send writes a udp packet to the target with the given data
+func (n *UDPNet) Send(to *node.NodeInfo, data []byte) error {
 
 	ns := n.cache.GetOrCreate(to.PublicKey())
-
-	if err != nil {
-		return err
-	}
 
 	sealed := ns.SealMessage(data)
 	final := p2pcrypto.PrependPubkey(sealed, n.local.PublicKey())
 
-	_, err = n.conn.WriteToUDP(final, raddr)
+	addr := NodeAddr(to)
+
+	_, err := n.conn.WriteToUDP(final, addr)
 
 	return err
-}
-
-func resolveUDPAddr(addr string) (*net.UDPAddr, error) {
-	raddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO: only accept local (unspecified/loopback) IPs from other local ips.
-	if raddr.IP.IsUnspecified() {
-		if ip4 := raddr.IP.To4(); ip4 != nil {
-			raddr.IP = IPv4LoopbackAddress
-		} else if ip6 := raddr.IP.To16(); ip6 != nil {
-			raddr.IP = net.IPv6loopback
-		}
-	}
-
-	return raddr, nil
 }
 
 // IncomingMessages is a channel where incoming UDPMessagesEvents will stream
@@ -152,7 +123,7 @@ func (n *UDPNet) listenToUDPNetworkMessages(listener net.PacketConn) {
 			if temp, ok := err.(interface {
 				Temporary() bool
 			}); ok && temp.Temporary() {
-				n.logger.Warning("Temporary UDP error", err)
+				n.logger.Debug("Temporary UDP error", err)
 				continue
 			} else {
 				n.logger.With().Error("Listen UDP error, stopping server", log.Err(err))
@@ -161,27 +132,32 @@ func (n *UDPNet) listenToUDPNetworkMessages(listener net.PacketConn) {
 
 		}
 
-		// todo : check size?
+		if n.config.MsgSizeLimit != config.UnlimitedMsgSize && size > n.config.MsgSizeLimit {
+			n.logger.With().Error("listenToUDPNetworkMessages: message is too big",
+				log.Int("limit", n.config.MsgSizeLimit), log.Int("actual", size))
+			continue
+		}
+
 		copybuf := make([]byte, size)
 		copy(copybuf, buf)
 
 		msg, pk, err := p2pcrypto.ExtractPubkey(copybuf)
 
 		if err != nil {
-			n.logger.Warning("error can't extract public key from udp message. (addr=%v), err=%v", addr.String(), err)
+			n.logger.Debug("error can't extract public key from udp message. (addr=%v), err=%v", addr.String(), err)
 			continue
 		}
 
 		ns := n.cache.GetOrCreate(pk)
 
 		if ns == nil {
-			n.logger.Warning("coul'd not create session with %v:%v skipping message..", addr.String(), pk.String())
+			n.logger.Debug("coul'd not create session with %v:%v skipping message..", addr.String(), pk.String())
 			continue
 		}
 
 		final, err := ns.OpenMessage(msg)
 		if err != nil {
-			n.logger.Warning("skipping udp with session message err=%v msg=", err, copybuf)
+			n.logger.Debug("skipping udp with session message err=%v msg=", err, copybuf)
 			// todo: remove malfunctioning session, ban ip ?
 			continue
 		}

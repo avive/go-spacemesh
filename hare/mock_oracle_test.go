@@ -2,6 +2,7 @@ package hare
 
 import (
 	"encoding/binary"
+	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/stretchr/testify/assert"
 	"math"
 	"math/rand"
@@ -12,14 +13,14 @@ import (
 const numOfClients = 100
 
 func TestMockHashOracle_Register(t *testing.T) {
-	oracle := NewMockHashOracle(numOfClients)
+	oracle := newMockHashOracle(numOfClients)
 	oracle.Register(generateSigning(t).PublicKey().String())
 	oracle.Register(generateSigning(t).PublicKey().String())
 	assert.Equal(t, 2, len(oracle.clients))
 }
 
 func TestMockHashOracle_Unregister(t *testing.T) {
-	oracle := NewMockHashOracle(numOfClients)
+	oracle := newMockHashOracle(numOfClients)
 	pub := generateSigning(t)
 	oracle.Register(pub.PublicKey().String())
 	assert.Equal(t, 1, len(oracle.clients))
@@ -28,7 +29,7 @@ func TestMockHashOracle_Unregister(t *testing.T) {
 }
 
 func TestMockHashOracle_Concurrency(t *testing.T) {
-	oracle := NewMockHashOracle(numOfClients)
+	oracle := newMockHashOracle(numOfClients)
 	c := make(chan Signer, 1000)
 	done := make(chan int, 2)
 
@@ -54,7 +55,7 @@ func TestMockHashOracle_Concurrency(t *testing.T) {
 	assert.Equal(t, len(oracle.clients), 100)
 }
 
-func genSig() Signature {
+func genSig() []byte {
 	s1 := rand.NewSource(time.Now().UnixNano())
 	r1 := rand.New(s1)
 	sig := make([]byte, 4, 4)
@@ -64,7 +65,7 @@ func genSig() Signature {
 }
 
 func TestMockHashOracle_Role(t *testing.T) {
-	oracle := NewMockHashOracle(numOfClients)
+	oracle := newMockHashOracle(numOfClients)
 	for i := 0; i < numOfClients; i++ {
 		pub := generateSigning(t)
 		oracle.Register(pub.PublicKey().String())
@@ -73,7 +74,8 @@ func TestMockHashOracle_Role(t *testing.T) {
 	committeeSize := 20
 	counter := 0
 	for i := 0; i < numOfClients; i++ {
-		if oracle.Eligible(0, committeeSize, generateSigning(t).PublicKey().String(), []byte(genSig())) {
+		res, _ := oracle.Eligible(0, 1, committeeSize, types.NodeId{Key: generateSigning(t).PublicKey().String()}, []byte(genSig()))
+		if res {
 			counter++
 		}
 	}
@@ -85,7 +87,7 @@ func TestMockHashOracle_Role(t *testing.T) {
 }
 
 func TestMockHashOracle_calcThreshold(t *testing.T) {
-	oracle := NewMockHashOracle(2)
+	oracle := newMockHashOracle(2)
 	oracle.Register(generateSigning(t).PublicKey().String())
 	oracle.Register(generateSigning(t).PublicKey().String())
 	assert.Equal(t, uint32(math.MaxUint32/2), oracle.calcThreshold(1))

@@ -1,13 +1,15 @@
 package tortoise
 
 import (
+	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/spacemeshos/go-spacemesh/log"
 	"github.com/spacemeshos/go-spacemesh/mesh"
-	"github.com/spacemeshos/go-spacemesh/types"
+	"sync"
 )
 
 type Algorithm struct {
 	Tortoise
+	sync.Mutex
 }
 
 type Tortoise interface {
@@ -17,17 +19,22 @@ type Tortoise interface {
 	getVotes() map[types.BlockID]vec
 }
 
-func NewAlgorithm(layerSize int, mdb *mesh.MeshDB, lg log.Log) *Algorithm {
-	alg := &Algorithm{Tortoise: NewNinjaTortoise(layerSize, mdb, lg)}
+func NewAlgorithm(layerSize int, mdb *mesh.MeshDB, hdist int, lg log.Log) *Algorithm {
+	alg := &Algorithm{Tortoise: NewNinjaTortoise(layerSize, mdb, hdist, lg)}
 	alg.HandleIncomingLayer(mesh.GenesisLayer())
 	return alg
 }
 func (alg *Algorithm) HandleLateBlock(b *types.Block) {
 	//todo feed all layers from b's layer to tortoise
-	log.Info("received block with mesh.LayerID %v block id: %v ", b.Layer(), b.ID())
+	l := types.NewLayer(b.Layer())
+	l.AddBlock(b)
+	alg.HandleIncomingLayer(l)
+	log.With().Info("late block ", log.LayerId(uint64(b.Layer())), log.BlockId(b.Id().String()))
 }
 
 func (alg *Algorithm) HandleIncomingLayer(ll *types.Layer) (types.LayerID, types.LayerID) {
+	alg.Lock()
+	defer alg.Unlock()
 	oldPbase := alg.latestComplete()
 	alg.Tortoise.handleIncomingLayer(ll)
 	newPbase := alg.latestComplete()
@@ -52,5 +59,6 @@ func updateMetrics(alg *Algorithm, ll *types.Layer) {
 }
 
 func (alg *Algorithm) ContextualValidity(id types.BlockID) bool {
+	//todo after each layer we should persist alg.getVote(id) in mesh
 	return alg.getVote(id) == Support
 }

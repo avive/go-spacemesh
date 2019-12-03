@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"github.com/spacemeshos/ed25519"
-	"github.com/spacemeshos/go-spacemesh/common"
+	"github.com/spacemeshos/go-spacemesh/common/util"
 	"github.com/spacemeshos/go-spacemesh/log"
 )
 
@@ -21,7 +21,7 @@ func (p *PublicKey) Bytes() []byte {
 }
 
 func (p *PublicKey) String() string {
-	return common.Bytes2Hex(p.Bytes())
+	return util.Bytes2Hex(p.Bytes())
 }
 
 func (p *PublicKey) ShortString() string {
@@ -70,6 +70,10 @@ func NewEdSigner() *EdSigner {
 
 func (es *EdSigner) Sign(m []byte) []byte {
 	return ed25519.Sign2(es.privKey, m)
+}
+
+func Verify(pubkey *PublicKey, message []byte, sign []byte) bool {
+	return ed25519.Verify2(ed25519.PublicKey(pubkey.Bytes()), message, sign)
 }
 
 func (es *EdSigner) PublicKey() *PublicKey {

@@ -1,7 +1,10 @@
 package log
 
 import (
+	"fmt"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"os"
 	"runtime/debug"
 	"time"
 )
@@ -35,7 +38,7 @@ func (l Log) Warning(format string, args ...interface{}) {
 }
 
 func (l Log) Panic(format string, args ...interface{}) {
-	l.sugar.Fatal("Fatal: goroutine panicked. Stacktrace: ", string(debug.Stack()))
+	l.sugar.Error("Fatal: goroutine panicked. Stacktrace: ", string(debug.Stack()))
 	l.sugar.Panicf(format, args...)
 }
 
@@ -87,6 +90,36 @@ func Duration(name string, val time.Duration) Field {
 	return Field(zap.Duration(name, val))
 }
 
+// LayerId return a Uint64 field (key - "layer_id")
+func LayerId(val uint64) Field {
+	return Uint64("layer_id", val)
+}
+
+// TxId return a String field (key - "tx_id")
+func TxId(val string) Field {
+	return String("tx_id", val)
+}
+
+// AtxId return a String field (key - "atx_id")
+func AtxId(val string) Field {
+	return String("atx_id", val)
+}
+
+// BlockId return a Uint64 field (key - "block_id")
+func BlockId(val string) Field {
+	return String("block_id", val)
+}
+
+// EpochId return a Uint64 field (key - "epoch_id")
+func EpochId(val uint64) Field {
+	return Uint64("epoch_id", val)
+}
+
+// NodeId return a String field (key - "node_id")
+func NodeId(val string) Field {
+	return String("node_id", val)
+}
+
 // Err returns an error field
 func Err(v error) Field {
 	return Field(zap.Error(v))
@@ -105,35 +138,93 @@ type fieldLogger struct {
 }
 
 // With returns a logger object that logs fields
-func (l *Log) With() fieldLogger {
+func (l Log) With() fieldLogger {
 	return fieldLogger{l.logger}
 }
 
 // LogWith returns a logger the given fields
-func (l *Log) WithName(prefix string) Log {
-	lgr := l.logger.Named(prefix)
+func (l Log) WithName(prefix string) Log {
+	lgr := l.logger.Named(fmt.Sprintf("%-13s", prefix))
 	return Log{
 		lgr,
 		lgr.Sugar(),
 	}
 }
 
-// Infow prints message with fields
+func AddDynamicLevel(level *zap.AtomicLevel) zap.Option {
+	return zap.WrapCore(func(core zapcore.Core) zapcore.Core {
+		return &coreWithLevel{
+			Core: core,
+			lvl:  level,
+		}
+	})
+}
+
+type coreWithLevel struct {
+	zapcore.Core
+	lvl *zap.AtomicLevel
+}
+
+func (c *coreWithLevel) Enabled(level zapcore.Level) bool {
+	return c.lvl.Enabled(level)
+}
+
+func (c *coreWithLevel) Check(e zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	if !c.lvl.Enabled(e.Level) {
+		return ce
+	}
+	return ce.AddCore(e, c.Core)
+}
+
+func (l Log) WithFields(fields ...Field) Log {
+	lgr := l.logger.With(unpack(fields...)...)
+	return Log{
+		logger: lgr,
+		sugar:  lgr.Sugar(),
+	}
+}
+
+const event_key = "event"
+
+func (l Log) Event() fieldLogger {
+	return fieldLogger{l: l.logger.With(unpack(Bool(event_key, true))...)}
+}
+
+func EnableLevelOption(enabler zapcore.LevelEnabler) zap.Option {
+	return zap.WrapCore(func(core zapcore.Core) zapcore.Core {
+		consoleSyncer := zapcore.AddSync(os.Stdout)
+		return zapcore.NewCore(encoder(), consoleSyncer, enabler)
+	})
+}
+
+var Nop = zap.WrapCore(func(zapcore.Core) zapcore.Core {
+	return zapcore.NewNopCore()
+})
+
+func (l Log) WithOptions(opts ...zap.Option) Log {
+	lgr := l.logger.WithOptions(opts...)
+	return Log{
+		logger: lgr,
+		sugar:  lgr.Sugar(),
+	}
+}
+
+// Info prints message with fields
 func (fl fieldLogger) Info(msg string, fields ...Field) {
 	fl.l.Info(msg, unpack(fields...)...)
 }
 
-// Debugw prints message with fields
+// Debug prints message with fields
 func (fl fieldLogger) Debug(msg string, fields ...Field) {
 	fl.l.Debug(msg, unpack(fields...)...)
 }
 
-// Errorw prints message with fields
+// Error prints message with fields
 func (fl fieldLogger) Error(msg string, fields ...Field) {
 	fl.l.Error(msg, unpack(fields...)...)
 }
 
-// Warningw prints message with fields
+// Warning prints message with fields
 func (fl fieldLogger) Warning(msg string, fields ...Field) {
 	fl.l.Warn(msg, unpack(fields...)...)
 }

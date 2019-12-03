@@ -40,7 +40,7 @@ type MessageServer struct {
 	ingressChannel     chan service.DirectMessage                   //chan to relay messages into the server
 	requestLifetime    time.Duration                                //time a request can stay in the pending queue until evicted
 	workerCount        sync.WaitGroup
-	workerLimiter      chan int
+	workerLimiter      chan struct{}
 	exit               chan struct{}
 }
 
@@ -60,7 +60,7 @@ func NewMsgServer(network Service, name string, requestLifetime time.Duration, c
 		msgRequestHandlers: make(map[MessageType]func(message Message) []byte),
 		requestLifetime:    requestLifetime,
 		exit:               make(chan struct{}),
-		workerLimiter:      make(chan int, runtime.NumCPU()),
+		workerLimiter:      make(chan struct{}, runtime.NumCPU()),
 	}
 
 	go p.readLoop()
@@ -74,8 +74,8 @@ func (p *MessageServer) Close() {
 }
 
 func (p *MessageServer) readLoop() {
+	timer := time.NewTicker(p.requestLifetime + time.Millisecond*100)
 	for {
-		timer := time.NewTicker(10 * time.Second)
 		select {
 		case <-p.exit:
 			p.Debug("shutting down protocol ", p.name)
@@ -84,18 +84,18 @@ func (p *MessageServer) readLoop() {
 		case <-timer.C:
 			go p.cleanStaleMessages()
 		case msg, ok := <-p.ingressChannel:
+			p.Debug("new msg received from channel")
 			if !ok {
 				p.Error("read loop channel was closed")
 				return
 			}
-
-			p.workerLimiter <- 1
 			p.workerCount.Add(1)
-			go func() {
-				defer p.workerCount.Done()
-				p.handleMessage(msg.(Message))
+			p.workerLimiter <- struct{}{}
+			go func(msg Message) {
+				p.handleMessage(msg)
 				<-p.workerLimiter
-			}()
+				p.workerCount.Done()
+			}(msg.(Message))
 
 		}
 	}
@@ -129,16 +129,17 @@ func (p *MessageServer) removeFromPending(reqID uint64) {
 		next = e.Next()
 		if reqID == e.Value.(Item).id {
 			p.pendingQueue.Remove(e)
+			p.Debug("removed request ", e.Value.(Item).id)
 			break
 		}
 	}
+	p.Debug("delete request result %v handler", reqID)
 	delete(p.resHandlers, reqID)
 	p.pendMutex.Unlock()
 }
 
 func (p *MessageServer) handleMessage(msg Message) {
 	data := msg.Data().(*service.DataMsgWrapper)
-
 	if data.Req {
 		p.handleRequestMessage(msg, data)
 	} else {
@@ -147,27 +148,35 @@ func (p *MessageServer) handleMessage(msg Message) {
 }
 
 func (p *MessageServer) handleRequestMessage(msg Message, data *service.DataMsgWrapper) {
-	if payload := p.msgRequestHandlers[MessageType(data.MsgType)](msg); payload != nil {
-		rmsg := &service.DataMsgWrapper{MsgType: data.MsgType, ReqID: data.ReqID, Payload: payload}
-		sendErr := p.network.SendWrappedMessage(msg.Sender(), p.name, rmsg)
-		if sendErr != nil {
-			p.Error("Error sending response message, err:", sendErr)
-		}
+	p.Debug("handleRequestMessage start")
+
+	foo, okFoo := p.msgRequestHandlers[MessageType(data.MsgType)]
+	if !okFoo {
+		p.Error("handler missing for request %v payload %v", data.ReqID)
+		return
 	}
+
+	p.Debug("handle request type %v", data.MsgType)
+	rmsg := &service.DataMsgWrapper{MsgType: data.MsgType, ReqID: data.ReqID, Payload: foo(msg)}
+	if sendErr := p.network.SendWrappedMessage(msg.Sender(), p.name, rmsg); sendErr != nil {
+		p.Error("Error sending response message, err:", sendErr)
+	}
+	p.Debug("handleRequestMessage close")
 }
 
 func (p *MessageServer) handleResponseMessage(headers *service.DataMsgWrapper) {
 	//get and remove from pendingMap
-	p.pendMutex.Lock()
+	p.Log.With().Debug("handleResponseMessage", log.Uint64("req_id", headers.ReqID))
+	p.pendMutex.RLock()
 	foo, okFoo := p.resHandlers[headers.ReqID]
-	p.pendMutex.Unlock()
+	p.pendMutex.RUnlock()
 	p.removeFromPending(headers.ReqID)
 	if okFoo {
-		log.Debug("found response handler %v", headers.ReqID)
 		foo(headers.Payload)
 	} else {
-		log.Error("Cant find handler %v", headers.ReqID)
+		p.Error("Cant find handler %v", headers.ReqID)
 	}
+	p.Debug("handleResponseMessage close")
 }
 
 func (p *MessageServer) RegisterMsgHandler(msgType MessageType, reqHandler func(message Message) []byte) {
@@ -182,7 +191,7 @@ func handlerFromBytesHandler(in func(msg []byte) []byte) func(message Message) [
 }
 
 func (p *MessageServer) RegisterBytesMsgHandler(msgType MessageType, reqHandler func([]byte) []byte) {
-	p.msgRequestHandlers[msgType] = handlerFromBytesHandler(reqHandler)
+	p.RegisterMsgHandler(msgType, handlerFromBytesHandler(reqHandler))
 }
 
 func (p *MessageServer) SendRequest(msgType MessageType, payload []byte, address p2pcrypto.PublicKey, resHandler func(msg []byte)) error {
@@ -197,7 +206,7 @@ func (p *MessageServer) SendRequest(msgType MessageType, payload []byte, address
 		p.removeFromPending(reqID)
 		return sendErr
 	}
-	p.Debug("sent request id: %v", reqID)
+	p.Log.With().Debug("sent request", log.Uint64("req_id", reqID))
 	return nil
 }
 

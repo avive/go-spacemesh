@@ -1,11 +1,9 @@
 package gossip
 
 import (
-	"github.com/gogo/protobuf/proto"
 	"github.com/spacemeshos/go-spacemesh/log"
 	"github.com/spacemeshos/go-spacemesh/p2p/config"
 	"github.com/spacemeshos/go-spacemesh/p2p/p2pcrypto"
-	"github.com/spacemeshos/go-spacemesh/p2p/pb"
 	"github.com/spacemeshos/go-spacemesh/p2p/service"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -162,18 +160,8 @@ func newPubkey(t *testing.T) p2pcrypto.PublicKey {
 	return pubkey
 }
 
-func newTestMessageData(t testing.TB, authPubkey p2pcrypto.PublicKey, payload []byte, protocol string) ([]byte, *pb.ProtocolMessage) {
-	pm := &pb.ProtocolMessage{
-		Metadata: &pb.Metadata{
-			NextProtocol:  protocol,
-			Timestamp:     time.Now().Unix(),
-			ClientVersion: protocolVer,
-			AuthPubkey:    authPubkey.Bytes(),
-		},
-		Payload: &pb.Payload{Data: &pb.Payload_Payload{payload}},
-	}
-
-	return makePayload(t, pm).Bytes(), pm
+func newTestMessageData(payload []byte) service.Data {
+	return service.DataBytes{Payload: payload}
 }
 
 func addPeersAndTest(t testing.TB, num int, p *Protocol, net *mockBaseNetwork, work bool) {
@@ -217,35 +205,26 @@ func TestNeighborhood_AddIncomingPeer(t *testing.T) {
 	assert.Equal(t, 1, n.peersCount())
 }
 
-func makePayload(t testing.TB, message *pb.ProtocolMessage) service.Data {
-	payload, err := proto.Marshal(message)
-	assert.NoError(t, err)
-	return service.DataBytes{Payload: payload}
-}
+//func makePayload(t testing.TB, message *pb.ProtocolMessage) service.Data {
+//	assert.NoError(t, err)
+//	return service.DataBytes{Payload: payload}
+//}
 
 func TestNeighborhood_Relay(t *testing.T) {
 	net := newMockBaseNetwork()
+	_ = net.RegisterGossipProtocol("Someproto")
 	n := NewProtocol(config.DefaultConfig().SwarmConfig, net, newPubkey(t), log.New("tesT", "", ""))
 	n.Start()
 
 	addPeersAndTest(t, 20, n, net, true)
 	pk := p2pcrypto.NewRandomPubkey()
-	pm := &pb.ProtocolMessage{
-		Metadata: &pb.Metadata{
-			NextProtocol:  ProtocolName,
-			Timestamp:     time.Now().Unix(),
-			ClientVersion: protocolVer,
-			AuthPubkey:    pk.Bytes(),
-		},
-		Payload: &pb.Payload{Data: &pb.Payload_Payload{[]byte("LOL")}},
-	}
 
-	payload := makePayload(t, pm)
+	payload := newTestMessageData([]byte("LOL"))
 
-	var msg service.DirectMessage = TestMessage{pk, payload}
+	//var msg service.DirectMessage = TestMessage{pk, payload}
 	net.pcountwg.Add(1)
 	net.msgwg.Add(20)
-	net.directInbox <- msg
+	require.NoError(t, n.Relay(pk, "Someproto", payload))
 	passOrDeadlock(t, net.pcountwg)
 	passOrDeadlock(t, net.msgwg)
 	assert.Equal(t, 1, net.processProtocolCount)
@@ -277,17 +256,15 @@ func TestNeighborhood_Relay2(t *testing.T) {
 	for pk == nil {
 		rnd := p2pcrypto.NewRandomPubkey()
 		n.peersMutex.RLock()
-		if _, ok := n.peers[rnd.String()]; ok {
+		if _, ok := n.peers[rnd]; ok {
 			n.peersMutex.RUnlock()
 			continue
 		}
 		n.peersMutex.RUnlock()
 		pk = rnd
 	}
-	msgB, _ := newTestMessageData(t, pk, []byte("LOL1"), "protocol")
-	var msg service.DirectMessage = TestMessage{pk, service.DataBytes{msgB}}
 	net.pcountwg.Add(1)
-	net.directInbox <- msg
+	require.NoError(t, n.Relay(pk, "protocol", service.DataBytes{[]byte("LOLZ")}))
 	passOrDeadlock(t, net.pcountwg)
 	assert.Equal(t, 1, net.processProtocolCount)
 	assert.Equal(t, 0, net.totalMessageSent())
@@ -297,10 +274,7 @@ func TestNeighborhood_Relay2(t *testing.T) {
 
 	addPeersAndTest(t, 20, n, net, true)
 
-	newmsg, _ := newTestMessageData(t, pk, []byte("LOL2"), "protocol")
-	var ready service.DirectMessage = TestMessage{pk, service.DataBytes{newmsg}}
-
-	net.directInbox <- ready
+	require.NoError(t, n.Relay(pk, "protocol", service.DataBytes{[]byte("LOL2")}))
 	passOrDeadlock(t, net.msgwg)
 	passOrDeadlock(t, net.pcountwg)
 	assert.Equal(t, 2, net.processProtocolCount)
@@ -358,8 +332,8 @@ func TestNeighborhood_Broadcast3(t *testing.T) {
 	assert.Equal(t, 1, net.processProtocolCount)
 	assert.Equal(t, 20, net.totalMessageSent())
 	pk2 := newPubkey(t)
-	payload, _ := newTestMessageData(t, pk2, msgB, "protocol")
-	var msg service.DirectMessage = TestMessage{pk2, service.DataBytes{payload}}
+	payload := newTestMessageData(msgB)
+	var msg service.DirectMessage = TestMessage{pk2, payload}
 	net.directInbox <- msg
 	passOrDeadlock(t, net.msgwg)
 	assert.Equal(t, 1, net.processProtocolCount)
@@ -400,17 +374,15 @@ func TestNeighborhood_Relay3(t *testing.T) {
 	n.Start()
 
 	pk := p2pcrypto.NewRandomPubkey()
-	payload, _ := newTestMessageData(t, pk, []byte("LOL"), "protocol")
-	var msg service.DirectMessage = TestMessage{pk, service.DataBytes{payload}}
 	net.pcountwg.Add(1)
-	net.directInbox <- msg
+	require.NoError(t, n.Relay(pk, "protocol", service.DataBytes{[]byte("LOL")}))
 	passOrDeadlock(t, net.pcountwg)
 	assert.Equal(t, 1, net.processProtocolCount)
 	assert.Equal(t, 0, net.totalMessageSent())
 
 	addPeersAndTest(t, 20, n, net, true)
 
-	net.directInbox <- msg
+	require.NoError(t, n.Relay(pk, "protocol", service.DataBytes{[]byte("LOL")}))
 
 	assert.Equal(t, 1, net.processProtocolCount)
 	assert.Equal(t, 0, net.totalMessageSent())
@@ -451,23 +423,23 @@ func TestNeighborhood_Disconnect(t *testing.T) {
 	assert.Equal(t, 2, n.peersCount())
 
 	pk := p2pcrypto.NewRandomPubkey()
-	msg, _ := newTestMessageData(t, pk, []byte("LOL"), "protocol")
+	//msg, _ := newTestMessageData(t, pk, []byte("LOL"), "protocol")
 
 	net.pcountwg.Add(1)
 	net.msgwg.Add(2)
-	net.directInbox <- TestMessage{pk, service.DataBytes{msg}}
+	require.NoError(t, n.Relay(pk, "protocol", service.DataBytes{[]byte("LOL")}))
 	passOrDeadlock(t, net.pcountwg)
 	passOrDeadlock(t, net.msgwg)
 	assert.Equal(t, 1, net.processProtocolCount)
 	assert.Equal(t, 2, net.totalMessageSent())
 
 	pk2 := p2pcrypto.NewRandomPubkey()
-	msg2, _ := newTestMessageData(t, pk2, []byte("LOL2"), "protocol")
 
 	n.removePeer(pub1)
 	net.pcountwg.Add(1)
 	net.msgwg.Add(1)
-	net.directInbox <- TestMessage{pk2, service.DataBytes{msg2}}
+	require.NoError(t, n.Relay(pk2, "protocol", service.DataBytes{[]byte("LOL2")}))
+
 	passOrDeadlock(t, net.pcountwg)
 	passOrDeadlock(t, net.msgwg)
 	assert.Equal(t, 2, net.processProtocolCount)
@@ -475,17 +447,7 @@ func TestNeighborhood_Disconnect(t *testing.T) {
 
 	n.addPeer(pub1)
 	net.msgwg.Add(1)
-	net.directInbox <- TestMessage{pk2, service.DataBytes{msg2}}
+	require.NoError(t, n.Relay(pk2, "protocol", service.DataBytes{[]byte("LOL2")}))
 	assert.Equal(t, 2, net.processProtocolCount)
 	assert.Equal(t, 3, net.totalMessageSent())
-}
-
-func TestHash(t *testing.T) {
-	msg1 := []byte("msg1")
-	msg2 := []byte("msg2")
-	prot1 := "prot1"
-	prot2 := "prot2"
-
-	assert.NotEqual(t, calcHash(msg1, prot1), calcHash(msg1, prot2))
-	assert.NotEqual(t, calcHash(msg1, prot1), calcHash(msg2, prot1))
 }

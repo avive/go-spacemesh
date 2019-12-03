@@ -8,10 +8,11 @@ BIN_DIR = $(CURR_DIR)/build
 BIN_DIR_WIN = $(CUR_DIR_WIN)/build
 export GO111MODULE = on
 
-ifdef TRAVIS_BRANCH
-	BRANCH := $(TRAVIS_BRANCH)
-else
-	BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
+BRANCH := $(shell bash -c 'if [ "$$TRAVIS_PULL_REQUEST" == "false" ]; then echo $$TRAVIS_BRANCH; else echo $$TRAVIS_PULL_REQUEST_BRANCH; fi')
+
+# Set BRANCH when running make manually
+ifeq ($(BRANCH),)
+BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
 endif
 
 # Setup the -ldflags option to pass vars defined here to app vars
@@ -47,12 +48,10 @@ else
 endif
 .PHONY: genproto
 
-build:
+build: genproto
 ifeq ($(OS),Windows_NT)
-	make genproto
 	go build ${LDFLAGS} -o $(BIN_DIR_WIN)/$(BINARY).exe
 else
-	make genproto
 	go build ${LDFLAGS} -o $(BIN_DIR)/$(BINARY)
 endif
 .PHONY: build
@@ -73,22 +72,36 @@ else
 endif
 .PHONY: p2p
 
+sync:
+ifeq ($(OS),WINDOWS_NT)
+	cd cmd/sync ; go build -o $(BIN_DIR_WIN)/go-sync.exe; cd ..
+else
+	cd cmd/sync ; go build -o $(BIN_DIR)/go-sync; cd ..
+endif
+.PHONY: sync
+
+harness:
+ifeq ($(OS),WINDOWS_NT)
+	cd cmd/integration ; go build -o $(BIN_DIR_WIN)/go-harness.exe; cd ..
+else
+	cd cmd/integration ; go build -o $(BIN_DIR)/go-harness; cd ..
+endif
+.PHONY: harness
+
 tidy:
 	go mod tidy
 .PHONY: tidy
 
-$(PLATFORMS):
+$(PLATFORMS): genproto
 ifeq ($(OS),Windows_NT)
-	make genproto
 	set GOOS=$(os)&&set GOARCH=amd64&&go build ${LDFLAGS} -o $(CURR_DIR)/$(BINARY)
 else
-	make genproto
 	GOOS=$(os) GOARCH=amd64 go build ${LDFLAGS} -o $(CURR_DIR)/$(BINARY)
 endif
 .PHONY: $(PLATFORMS)
 
-test:
-	ulimit -n 500; go test -short -p 1 ./...
+test: genproto
+	ulimit -n 500; go test -timeout 0 -p 1 ./...
 .PHONY: test
 
 test-tidy:
@@ -122,29 +135,109 @@ dockerbuild-go:
 	docker build -t $(DOCKER_IMAGE_REPO):$(BRANCH) .
 .PHONY: dockerbuild-go
 
+dockerbuild-test:
+	docker build -f DockerFileTests --build-arg GCLOUD_KEY="$(GCLOUD_KEY)" \
+	             --build-arg PROJECT_NAME="$(PROJECT_NAME)" \
+	             --build-arg CLUSTER_NAME="$(CLUSTER_NAME)" \
+	             --build-arg CLUSTER_ZONE="$(CLUSTER_ZONE)" \
+	             -t go-spacemesh-python:$(BRANCH) .
+.PHONY: dockerbuild-test
+
 dockerpush: dockerbuild-go
 	echo "$(DOCKER_PASSWORD)" | docker login -u "$(DOCKER_USERNAME)" --password-stdin
 	docker tag $(DOCKER_IMAGE_REPO):$(BRANCH) spacemeshos/$(DOCKER_IMAGE_REPO):$(BRANCH)
 	docker push spacemeshos/$(DOCKER_IMAGE_REPO):$(BRANCH)
+
 ifeq ($(BRANCH),develop)
 	docker tag $(DOCKER_IMAGE_REPO):$(BRANCH) spacemeshos/$(DOCKER_IMAGE_REPO):$(SHA)
 	docker push spacemeshos/$(DOCKER_IMAGE_REPO):$(SHA)
 endif
 .PHONY: dockerpush
 
-dockerbuild-test:
-	docker build -f DockerFileTests --build-arg GCLOUD_KEY="$(GCLOUD_KEY)" \
-	             --build-arg PROJECT_NAME="$(PROJECT_NAME)" \
-	             --build-arg CLUSTER_NAME="$(CLUSTER_NAME)" \
-	             --build-arg CLUSTER_ZONE="$(CLUSTER_ZONE)" \
-	             -t go-spacemesh-python:latest .
-.PHONY: dockerbuild-test
 
-dockerrun-test: dockerbuild-test
+ifdef TEST
+DELIM=::
+endif
+
+
+dockerrun-p2p:
 ifndef ES_PASSWD
 	$(error ES_PASSWD is not set)
 endif
-	docker run -e ES_PASSWD="$(ES_PASSWD)" -e GOOGLE_APPLICATION_CREDENTIALS=./spacemesh.json -it go-spacemesh-python pytest -s test_bs.py --tc-file=config.yaml --tc-format=yaml
-	docker run -e ES_PASSWD="$(ES_PASSWD)" -e GOOGLE_APPLICATION_CREDENTIALS=./spacemesh.json -it go-spacemesh-python pytest -s hare/test_hare.py --tc-file=hare/config.yaml --tc-format=yaml
+	docker run --rm -e ES_PASSWD="$(ES_PASSWD)" \
+		-e GOOGLE_APPLICATION_CREDENTIALS=./spacemesh.json \
+		-e CLIENT_DOCKER_IMAGE="spacemeshos/$(DOCKER_IMAGE_REPO):$(BRANCH)" \
+		-it go-spacemesh-python:$(BRANCH) pytest -s -v p2p/test_p2p.py --tc-file=p2p/config.yaml --tc-format=yaml
+.PHONY: dockerrun-p2p
+
+dockertest-p2p: dockerbuild-test dockerrun-p2p
+.PHONY: dockertest-p2p
+
+dockerrun-mining:
+ifndef ES_PASSWD
+	$(error ES_PASSWD is not set)
+endif
+	docker run --rm -e ES_PASSWD="$(ES_PASSWD)" \
+		-e GOOGLE_APPLICATION_CREDENTIALS=./spacemesh.json \
+		-e CLIENT_DOCKER_IMAGE="spacemeshos/$(DOCKER_IMAGE_REPO):$(BRANCH)" \
+		-it go-spacemesh-python:$(BRANCH) pytest -s -v test_bs.py --tc-file=config.yaml --tc-format=yaml
+.PHONY: dockerrun-mining
+
+dockertest-mining: dockerbuild-test dockerrun-mining
+.PHONY: dockertest-mining
+
+dockerrun-hare:
+ifndef ES_PASSWD
+	$(error ES_PASSWD is not set)
+endif
+	docker run --rm -e ES_PASSWD="$(ES_PASSWD)" \
+		-e GOOGLE_APPLICATION_CREDENTIALS=./spacemesh.json \
+		-e CLIENT_DOCKER_IMAGE="spacemeshos/$(DOCKER_IMAGE_REPO):$(BRANCH)" \
+		-it go-spacemesh-python:$(BRANCH) pytest -s -v hare/test_hare.py::test_hare_sanity --tc-file=hare/config.yaml --tc-format=yaml
+.PHONY: dockerrun-hare
+
+dockertest-hare: dockerbuild-test dockerrun-hare
+.PHONY: dockertest-hare
+
+dockerrun-sync:
+ifndef ES_PASSWD
+	$(error ES_PASSWD is not set)
+endif
+
+	docker run --rm -e ES_PASSWD="$(ES_PASSWD)" \
+		-e GOOGLE_APPLICATION_CREDENTIALS=./spacemesh.json \
+		-e CLIENT_DOCKER_IMAGE="spacemeshos/$(DOCKER_IMAGE_REPO):$(BRANCH)" \
+		-it go-spacemesh-python:$(BRANCH) pytest -s -v sync/test_sync.py --tc-file=sync/config.yaml --tc-format=yaml
+
+.PHONY: dockerrun-sync
+
+dockertest-sync: dockerbuild-test dockerrun-sync
+.PHONY: dockertest-sync
+
+dockertest-harness: dockerbuild-test dockerrun-harness
+.PHONY: dockertest-harness
+
+# command for late nodes
+
+dockerrun-late-nodes:
+ifndef ES_PASSWD
+	$(error ES_PASSWD is not set)
+endif
+
+	docker run --rm -e ES_PASSWD="$(ES_PASSWD)" \
+		-e GOOGLE_APPLICATION_CREDENTIALS=./spacemesh.json \
+		-e CLIENT_DOCKER_IMAGE="spacemeshos/$(DOCKER_IMAGE_REPO):$(BRANCH)" \
+		-it go-spacemesh-python:$(BRANCH) pytest -s -v late_nodes/test_delayed.py --tc-file=late_nodes/delayed_config.yaml --tc-format=yaml
+
+.PHONY: dockerrun-late-nodes
+
+dockertest-late-nodes: dockerbuild-test dockerrun-late-nodes
+.PHONY: dockertest-late-nodes
+
+# The following is used to run tests one after the other locally
+dockerrun-test: dockerbuild-test dockerrun-p2p dockerrun-mining dockerrun-hare dockerrun-sync
 .PHONY: dockerrun-test
+
+dockerrun-all: dockerpush dockerrun-test
+.PHONY: dockerrun-all
 

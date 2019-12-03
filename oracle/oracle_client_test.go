@@ -3,6 +3,7 @@ package oracle
 import (
 	"fmt"
 	"github.com/btcsuite/btcutil/base58"
+	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/spacemeshos/go-spacemesh/rand"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -72,14 +73,14 @@ func Test_MockOracleClientValidate(t *testing.T) {
 	oc.Register(true, id)
 	require.Equal(t, counter.reqCounter, 1)
 
-	mr.SetResult(Validate, validateQuery(oc.world, 0, 2),
+	mr.SetResult(Validate, validateQuery(oc.world, hashInstanceAndK(0, 0), 2),
 		[]byte(fmt.Sprintf(`{ "IDs": [ "%v" ] }`, id)))
 
-	valid := oc.Eligible(0, 2, id)
+	valid, _ := oc.Eligible(0, 0, 2, types.NodeId{Key: id}, nil)
 
 	require.True(t, valid)
 
-	valid = oc.Eligible(0, 2, generateID())
+	valid, _ = oc.Eligible(0, 0, 2, types.NodeId{Key: generateID()}, nil)
 
 	require.Equal(t, counter.reqCounter, 2)
 	require.False(t, valid)
@@ -105,7 +106,8 @@ func Test_OracleClientValidate(t *testing.T) {
 	incommitte := 0
 
 	for i := 0; i < size; i++ {
-		if oc.Eligible(0, committee, pks[i]) {
+		res, _ := oc.Eligible(0, 0, committee, types.NodeId{Key: pks[i]}, nil)
+		if res {
 			incommitte++
 		}
 	}
@@ -142,7 +144,8 @@ func Test_Concurrency(t *testing.T) {
 	oc.client = mc
 	mc.setCounting(true)
 	for i := 0; i < size; i++ {
-		if oc.Eligible(0, committee, pks[i]) {
+		res, _ := oc.Eligible(0, 0, committee, types.NodeId{Key: pks[i]}, nil)
+		if res {
 			incommitte++
 		}
 	}
@@ -154,4 +157,23 @@ func Test_Concurrency(t *testing.T) {
 	}
 
 	assert.Equal(t, mc.reqCounter, 1)
+}
+
+func TestOracle_Eligible2(t *testing.T) {
+	o := NewOracleClient()
+	mr := &mockRequester{results: make(map[string][]byte)}
+	//id := generateID()
+	mr.SetResult(Register, "myid", []byte(`{ "message": "ok" }"`))
+	o.client = mr
+	o.Register(true, "myid")
+	mr.SetResult(Validate, validateQuery(o.world, hashInstanceAndK(1, 2), 0),
+		[]byte(fmt.Sprintf(`{ "IDs": [ "%v" ] }`, "sheker")))
+	res, err := o.Eligible(1, 2, 0, types.NodeId{}, []byte{})
+	assert.Nil(t, err)
+	assert.False(t, res)
+	mr.SetResult(Validate, validateQuery(o.world, hashInstanceAndK(1, 3), 1),
+		[]byte(fmt.Sprintf(`{ "IDs": [ "%v" ] }`, "sheker")))
+	res, err = o.Eligible(1, 3, 1, types.NodeId{}, []byte{})
+	assert.Nil(t, err)
+	assert.False(t, res)
 }

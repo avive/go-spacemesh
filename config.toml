@@ -8,11 +8,13 @@
 data-folder = "~/.spacemesh-data"
 test-mode = false
 metrics = false
-metrics-port = 1010
+metrics-port = 2020
 oracle_server = "http://localhost:3030"
 oracle_server_worldid = 0
 genesis-time = "2019-02-13T17:02:00+00:00"
 layer-duration-sec = "5"
+hdist = "5"
+coinbase = "0x1234"
 
 # Node Config
 [p2p]
@@ -30,6 +32,7 @@ max-pending-connections = 50
 target-outbound = 10
 max-inbound = 100
 buffer-size = 100
+peers-file = "peers.json" # located under data-dir/<publickey>/<peer-file> not loaded or save if empty string is given.
 
 # Node Swarm Config
 [p2p.swarm]
@@ -37,7 +40,7 @@ bootstrap = false
 bucketsize = 20 # Routing table bucket size
 alpha = 3 # Routing table alpha
 randcon = 2 # Number of random connections
-bootnodes = ["0.0.0.0:7517/j7qWfWaJRVp25ZsnCu9rJ4PmhigZBtesB4YmQHqqPvtR"]
+bootnodes = [] # example : spacemesh://j7qWfWaJRVp25ZsnCu9rJ4PmhigZBtesB4YmQHqqPvt@0.0.0.0:7517?disc=7517
 
 # API Config
 [api]
@@ -57,3 +60,28 @@ default-timeout-latency = "10s"
 hare-round-duration-sec = "5"
 hare-committee-size = 10
 hare-max-adversaries = 5
+hare-wakeup-delta = 5
+
+[logging]
+app = "info"
+post = "info"
+stateDb= "info"
+state = "info"
+atxDb = "info"
+poetDb = "info"
+store = "info"
+poetDb = "info"
+meshDb = "info"
+trtl = "info"
+atxDb = "info"
+block-eligibility = "info"
+mesh = "info"
+sync = "info"
+block-oracle = "info"
+hare-oracle = "info"
+hare = "info"
+block-builder = "info"
+block-listener = "info"
+poet = "info"
+nipst = "info"
+atx-builder = "info"

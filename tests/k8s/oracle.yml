@@ -1,13 +1,15 @@
 apiVersion: extensions/v1beta1
 kind: Deployment
 metadata:
-  name: oracle
+  name: sm-oracle
 spec:
   replicas: 1
   template:
     metadata:
       labels:
         name: oracle
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: 'false'
     spec:
       containers:
       - name: oracle

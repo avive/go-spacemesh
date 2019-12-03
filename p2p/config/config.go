@@ -24,6 +24,8 @@ func duration(duration string) (dur time.Duration) {
 	return dur
 }
 
+const UnlimitedMsgSize = 0
+
 // Config defines the configuration options for the Spacemesh peer-to-peer networking layer
 type Config struct {
 	TCPPort               int           `mapstructure:"tcp-port"`
@@ -39,6 +41,7 @@ type Config struct {
 	MaxInboundPeers       int           `mapstructure:"max-inbound"`
 	SwarmConfig           SwarmConfig   `mapstructure:"swarm"`
 	BufferSize            int           `mapstructure:"buffer-size"`
+	MsgSizeLimit          int           `mapstructure:"msg-size-limit"` // in bytes
 }
 
 // SwarmConfig specifies swarm config params.
@@ -49,6 +52,7 @@ type SwarmConfig struct {
 	RoutingTableAlpha      int      `mapstructure:"alpha"`
 	RandomConnections      int      `mapstructure:"randcon"`
 	BootstrapNodes         []string `mapstructure:"bootnodes"`
+	PeersFile              string   `mapstructure:"peers-file"`
 }
 
 // DefaultConfig defines the default p2p configuration
@@ -63,6 +67,7 @@ func DefaultConfig() Config {
 		RandomConnections:      5,
 		BootstrapNodes:         []string{ // these should be the spacemesh foundation bootstrap nodes
 		},
+		PeersFile: "peers.json", //  located under data-dir/<publickey>/<peer-file> not loaded or save if empty string is given.
 	}
 
 	return Config{
@@ -72,12 +77,13 @@ func DefaultConfig() Config {
 		DialTimeout:           duration("1m"),
 		ConnKeepAlive:         duration("48h"),
 		NetworkID:             TestNet,
-		ResponseTimeout:       duration("15s"),
-		SessionTimeout:        duration("5s"),
+		ResponseTimeout:       duration("60s"),
+		SessionTimeout:        duration("15s"),
 		MaxPendingConnections: 100,
 		OutboundPeersTarget:   10,
 		MaxInboundPeers:       100,
 		SwarmConfig:           SwarmConfigValues,
-		BufferSize:            100,
+		BufferSize:            10000,
+		MsgSizeLimit:          UnlimitedMsgSize,
 	}
 }

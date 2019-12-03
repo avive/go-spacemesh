@@ -1,88 +1,119 @@
 import time
-from elasticsearch_dsl import Search, Q
+import pytest
 from pytest_testconfig import config as testconfig
 
-from tests.fixtures import set_namespace, load_config, session_id
-from tests.test_bs import setup_clients, save_log_on_exit, setup_oracle, setup_bootstrap, create_configmap
-from tests.test_bs import get_elastic_search_api
-from tests.test_bs import current_index, wait_genesis
+from tests import deployment
+from tests.conftest import DeploymentInfo
+from tests.hare.assert_hare import expect_hare, assert_all, get_max_mem_usage
+from tests.test_bs import current_index, setup_bootstrap_in_namespace, setup_clients_in_namespace, create_configmap, wait_genesis
+from tests.misc import CoreV1ApiClient
+
+ORACLE_DEPLOYMENT_FILE = './k8s/oracle.yml'
 
 
-class Set:
-    def __init__(self, values):
-        self.values = {}
-        for v in values:
-            self.values[v] = v
+def setup_server(deployment_name, deployment_file, namespace):
+    deployment_name_prefix = deployment_name.split('-')[1]
+    namespaced_pods = CoreV1ApiClient().list_namespaced_pod(namespace,
+                                                            label_selector=(
+                                                                "name={0}".format(deployment_name_prefix))).items
+    if namespaced_pods:
+        # if server already exist -> delete it
+        deployment.delete_deployment(deployment_name, namespace)
 
-    @classmethod
-    def from_str(cls, s):
-        values = [x.strip() for x in s.split(',')]
-        return cls(values)
+    resp = deployment.create_deployment(deployment_file, namespace, time_out=testconfig['deployment_ready_time_out'])
+    namespaced_pods = CoreV1ApiClient().list_namespaced_pod(namespace,
+                                                            label_selector=(
+                                                                "name={0}".format(deployment_name_prefix))).items
+    if not namespaced_pods:
+        raise Exception('Could not setup Server: {0}'.format(deployment_name))
 
-    def contains(self, val):
-        return val in self.values
+    ip = namespaced_pods[0].status.pod_ip
+    if ip is None:
+        print("{0} IP was None, trying again..".format(deployment_name_prefix))
+        time.sleep(3)
+        # retry
+        namespaced_pods = CoreV1ApiClient().list_namespaced_pod(namespace,
+                                                                label_selector=(
+                                                                    "name={0}".format(deployment_name_prefix))).items
+        ip = namespaced_pods[0].status.pod_ip
+        if ip is None:
+            raise Exception("Failed to retrieve {0} ip address".format(deployment_name_prefix))
 
-    def equals(self, other):
-        for v in self.values:
-            if v not in other.values:
-                return False
-        return True
+    return ip
 
-
-def consistency(outputs):
-    for s in outputs:
-        for g in outputs:
-            if not g.equals(s):
-                return False
-    return True
-
-
-def v1(outputs, intersection):
-    for v in intersection:
-        if not outputs.contains(v):
-            return False
-    return True
-
-
-def validate(outputs):
-    sets = [Set.from_str(o) for o in outputs]
-
-    if not consistency(sets):
-        print("consistency failed")
-        return False
-    return True
+# ==============================================================================
+#    Fixtures
+# ==============================================================================
+@pytest.fixture(scope='module')
+def setup_oracle(request):
+    oracle_deployment_name = 'sm-oracle'
+    return setup_server(oracle_deployment_name, ORACLE_DEPLOYMENT_FILE, testconfig['namespace'])
 
 
-def query_hare_output_set(indx, namespace, client_po_name):
-    es = get_elastic_search_api()
-    fltr = Q("match_phrase", kubernetes__namespace_name=namespace) & \
-           Q("match_phrase", kubernetes__pod_name=client_po_name) & \
-           Q("match_phrase", M="Consensus process terminated")
-    s = Search(index=indx, using=es).query('bool', filter=[fltr])
-    hits = list(s.scan())
+@pytest.fixture(scope='module')
+def setup_bootstrap_for_hare(request, init_session, setup_oracle):
+    bootstrap_deployment_info = DeploymentInfo(dep_id=init_session)
+    return setup_bootstrap_in_namespace(testconfig['namespace'],
+                                        bootstrap_deployment_info,
+                                        testconfig['bootstrap'],
+                                        oracle=setup_oracle,
+                                        dep_time_out=testconfig['deployment_ready_time_out'])
 
-    lst = []
-    for h in hits:
-        lst.append(h.set_values)
-    return lst
+
+@pytest.fixture(scope='module')
+def setup_clients_for_hare(request, init_session, setup_oracle, setup_bootstrap_for_hare):
+    client_info = DeploymentInfo(dep_id=setup_bootstrap_for_hare.deployment_id)
+    return setup_clients_in_namespace(testconfig['namespace'],
+                                      setup_bootstrap_for_hare.pods[0],
+                                      client_info,
+                                      testconfig['client'],
+                                      oracle=setup_oracle,
+                                      dep_time_out=testconfig['deployment_ready_time_out'])
+
 
 # ==============================================================================
 #    TESTS
 # ==============================================================================
 
 
-NUM_OF_EXPECTED_ROUNDS = 5
-EFK_LOG_PROPAGATION_DELAY = 10
+EFK_LOG_PROPAGATION_DELAY = 20
 
 
-def test_hare_sanity(set_namespace, setup_clients, save_log_on_exit):
-    wait_genesis()
+# simple sanity test run for one layer
+def test_hare_sanity(init_session, setup_bootstrap_for_hare, setup_clients_for_hare, wait_genesis):
     # Need to wait for 1 full iteration + the time it takes the logs to propagate to ES
-    delay = int(testconfig['client']['args']['hare-round-duration-sec']) * NUM_OF_EXPECTED_ROUNDS + \
-            EFK_LOG_PROPAGATION_DELAY
+    round_duration = int(testconfig['client']['args']['hare-round-duration-sec'])
+    wakeup_delta = int(testconfig['client']['args']['hare-wakeup-delta'])
+    layer_duration = int(testconfig['client']['args']['layer-duration-sec'])
+    layers_count = int(1)
+    print("Number of layers is ", layers_count)
+    delay = layer_duration * layers_count + EFK_LOG_PROPAGATION_DELAY + wakeup_delta * (layers_count - 1) + round_duration
     print("Going to sleep for {0}".format(delay))
     time.sleep(delay)
-    lst = query_hare_output_set(current_index, testconfig['namespace'], setup_clients.deployment_id)
-    total = testconfig['bootstrap']['replicas'] + testconfig['client']['replicas']
-    assert total == len(lst)
-    assert validate(lst)
+
+    assert_all(current_index, testconfig['namespace'])
+
+
+EXPECTED_MAX_MEM = 300*1024*1024  # MB
+
+
+# scale test run for 3 layers
+def test_hare_scale(init_session, setup_bootstrap_for_hare, setup_clients_for_hare, wait_genesis):
+    total = int(testconfig['client']['replicas']) + int(testconfig['bootstrap']['replicas'])
+
+    # Need to wait for 1 full iteration + the time it takes the logs to propagate to ES
+    round_duration = int(testconfig['client']['args']['hare-round-duration-sec'])
+    wakeup_delta = int(testconfig['client']['args']['hare-wakeup-delta'])
+    layer_duration = int(testconfig['client']['args']['layer-duration-sec'])
+    layers_count = int(10)
+    print("Number of layers is ", layers_count)
+    delay = layer_duration * layers_count + EFK_LOG_PROPAGATION_DELAY + wakeup_delta * (layers_count - 1) + round_duration
+    print("Going to sleep for {0}".format(delay))
+    time.sleep(delay)
+
+    ns = testconfig['namespace']
+    f = int(testconfig['client']['args']['hare-max-adversaries'])
+    expect_hare(current_index, ns, 1, layers_count, total, f)
+    max_mem = get_max_mem_usage(current_index, ns)
+    print('Mem usage is {0} expected max is {1}'.format(max_mem, EXPECTED_MAX_MEM))
+    assert max_mem < EXPECTED_MAX_MEM

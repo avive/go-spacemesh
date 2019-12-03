@@ -2,18 +2,22 @@ package hare
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"github.com/nullstyle/go-xdr/xdr3"
+	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/spacemeshos/go-spacemesh/log"
 	"github.com/spacemeshos/go-spacemesh/signing"
 )
 
-// top InnerMsg of the protocol
+// Message is the tuple of a message and its corresponding signature.
 type Message struct {
 	Sig      []byte
-	InnerMsg *InnerMessage
+	InnerMsg *innerMessage
 }
 
+// MessageFromBuffer builds an Hare message from the provided bytes buffer.
+// It returns an error if unmarshal of the provided byte slice failed.
 func MessageFromBuffer(buffer []byte) (*Message, error) {
 	rdr := bytes.NewReader(buffer)
 	hareMsg := &Message{}
@@ -27,108 +31,124 @@ func MessageFromBuffer(buffer []byte) (*Message, error) {
 }
 
 func (m *Message) String() string {
-	return fmt.Sprintf("Sig: %v InnerMsg: %v", m.Sig, m.InnerMsg.String())
+	sig := hex.EncodeToString(m.Sig)
+	l := len(sig)
+	if l > 5 {
+		l = 5
+	}
+	return fmt.Sprintf("Sig: %v… InnerMsg: %v", sig[:l], m.InnerMsg.String())
 }
 
-// the certificate
-type Certificate struct {
-	Values  []uint64 // the committed set S
-	AggMsgs *AggregatedMessages
+// certificate is a collection of messages and the set of values.
+// Typically used as a collection of commit messages.
+type certificate struct {
+	Values  []types.BlockID // the committed set S
+	AggMsgs *aggregatedMessages
 }
 
-// Aggregated Messages
-type AggregatedMessages struct {
-	Messages []*Message // a collection of Messages
-	AggSig   []byte
+// aggregatedMessages is a collection of messages.
+type aggregatedMessages struct {
+	Messages []*Message
 }
 
-// basic InnerMsg
-type InnerMessage struct {
-	Type       MessageType
-	InstanceId InstanceId
+// innerMessage is the actual set of fields that describe a message in the Hare protocol.
+type innerMessage struct {
+	Type       messageType
+	InstanceId instanceId
 	K          int32 // the round counter
 	Ki         int32
-	Values     []uint64            // the set S. optional for commit InnerMsg in a certificate
+	Values     []types.BlockID     // the set S. optional for commit InnerMsg in a certificate
 	RoleProof  []byte              // role is implicit by InnerMsg type, this is the proof
-	Svp        *AggregatedMessages // optional. only for proposal Messages
-	Cert       *Certificate        // optional
+	Svp        *aggregatedMessages // optional. only for proposal Messages
+	Cert       *certificate        // optional
 }
 
-func (im *InnerMessage) String() string {
+// Bytes returns the message as bytes.
+func (im *innerMessage) Bytes() []byte {
+	var w bytes.Buffer
+	_, err := xdr.Marshal(&w, im)
+	if err != nil {
+		log.Panic("could not marshal InnerMsg before send")
+	}
+
+	return w.Bytes()
+}
+
+func (im *innerMessage) String() string {
 	return fmt.Sprintf("Type: %v InstanceId: %v K: %v Ki: %v", im.Type, im.InstanceId, im.K, im.Ki)
 }
 
-// Used to build proto Messages
-type MessageBuilder struct {
+// messageBuilder is the impl of the builder DP.
+// It allows the user to set the different fields of the builder and eventually Build the message.
+type messageBuilder struct {
 	msg   *Msg
-	inner *InnerMessage
+	inner *innerMessage
 }
 
-func NewMessageBuilder() *MessageBuilder {
-	m := &MessageBuilder{&Msg{&Message{}, nil}, &InnerMessage{}}
+// NewMessageBuilder returns a new, empty message builder.
+// One should not assume any values are pre-set.
+func NewMessageBuilder() *messageBuilder {
+	m := &messageBuilder{&Msg{&Message{}, nil}, &innerMessage{}}
 	m.msg.InnerMsg = m.inner
 
 	return m
 }
 
-func (builder *MessageBuilder) Build() *Msg {
+// Build returns the protocol message as type Msg.
+func (builder *messageBuilder) Build() *Msg {
 	return builder.msg
 }
 
-func (builder *MessageBuilder) SetCertificate(certificate *Certificate) *MessageBuilder {
+func (builder *messageBuilder) SetCertificate(certificate *certificate) *messageBuilder {
 	builder.msg.InnerMsg.Cert = certificate
 	return builder
 }
 
-func (builder *MessageBuilder) Sign(signing Signer) *MessageBuilder {
-	var w bytes.Buffer
-	_, err := xdr.Marshal(&w, builder.inner)
-	if err != nil {
-		log.Panic("marshal failed during signing")
-	}
-
-	// TODO: do we always sign the same InnerMsg? order of Values (set)?
-	builder.msg.Sig = signing.Sign(w.Bytes())
+// Sign calls the provided signer to calculate the signature and then set it accordingly.
+func (builder *messageBuilder) Sign(signing Signer) *messageBuilder {
+	builder.msg.Sig = signing.Sign(builder.inner.Bytes())
 
 	return builder
 }
 
-func (builder *MessageBuilder) SetPubKey(pub *signing.PublicKey) *MessageBuilder {
+// SetPubKey sets the public key of the message.
+// Note: the message itself does not contain the public key. The builder returns the wrapper of the message which does.
+func (builder *messageBuilder) SetPubKey(pub *signing.PublicKey) *messageBuilder {
 	builder.msg.PubKey = pub
 	return builder
 }
 
-func (builder *MessageBuilder) SetType(msgType MessageType) *MessageBuilder {
+func (builder *messageBuilder) SetType(msgType messageType) *messageBuilder {
 	builder.inner.Type = msgType
 	return builder
 }
 
-func (builder *MessageBuilder) SetInstanceId(id InstanceId) *MessageBuilder {
+func (builder *messageBuilder) SetInstanceId(id instanceId) *messageBuilder {
 	builder.inner.InstanceId = id
 	return builder
 }
 
-func (builder *MessageBuilder) SetRoundCounter(k int32) *MessageBuilder {
+func (builder *messageBuilder) SetRoundCounter(k int32) *messageBuilder {
 	builder.inner.K = k
 	return builder
 }
 
-func (builder *MessageBuilder) SetKi(ki int32) *MessageBuilder {
+func (builder *messageBuilder) SetKi(ki int32) *messageBuilder {
 	builder.inner.Ki = ki
 	return builder
 }
 
-func (builder *MessageBuilder) SetValues(set *Set) *MessageBuilder {
-	builder.inner.Values = set.To2DSlice()
+func (builder *messageBuilder) SetValues(set *Set) *messageBuilder {
+	builder.inner.Values = set.ToSlice()
 	return builder
 }
 
-func (builder *MessageBuilder) SetRoleProof(sig Signature) *MessageBuilder {
+func (builder *messageBuilder) SetRoleProof(sig []byte) *messageBuilder {
 	builder.inner.RoleProof = sig
 	return builder
 }
 
-func (builder *MessageBuilder) SetSVP(svp *AggregatedMessages) *MessageBuilder {
+func (builder *messageBuilder) SetSVP(svp *aggregatedMessages) *messageBuilder {
 	builder.inner.Svp = svp
 	return builder
 }

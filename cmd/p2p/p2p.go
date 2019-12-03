@@ -16,7 +16,6 @@ var Cmd = &cobra.Command{
 	Use:   "p2p",
 	Short: "start p2p",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("Starting p2p")
 		p2pApp := NewP2PApp()
 		defer p2pApp.Cleanup()
 
@@ -45,6 +44,7 @@ func (app *P2PApp) Cleanup() {
 func (app *P2PApp) Start(cmd *cobra.Command, args []string) {
 	// init p2p services
 	log.JSONLog(true)
+	log.DebugMode(true)
 	log.Info("Initializing P2P services")
 	swarm, err := p2p.New(cmdp.Ctx, app.Config.P2P)
 	if err != nil {
@@ -69,14 +69,14 @@ func (app *P2PApp) Start(cmd *cobra.Command, args []string) {
 	if app.Config.API.StartGrpcServer || app.Config.API.StartJSONServer {
 		// start grpc if specified or if json rpc specified
 		log.Info("Started the GRPC Service")
-		grpc := api.NewGrpcService(app.p2p, nil)
-		grpc.StartService(nil)
+		grpc := api.NewGrpcService(app.p2p, nil, nil, nil, nil, nil, nil, nil, 0, nil)
+		grpc.StartService()
 	}
 
 	if app.Config.API.StartJSONServer {
 		log.Info("Started the JSON Service")
 		json := api.NewJSONHTTPServer()
-		json.StartService(nil)
+		json.StartService()
 	}
 
 	<-cmdp.Ctx.Done()

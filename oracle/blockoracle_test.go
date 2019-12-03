@@ -3,39 +3,60 @@ package oracle
 import (
 	"errors"
 	"fmt"
-	"github.com/spacemeshos/go-spacemesh/crypto"
-	"github.com/spacemeshos/go-spacemesh/types"
+	"github.com/spacemeshos/go-spacemesh/amcl/BLS381"
+	"github.com/spacemeshos/go-spacemesh/common/types"
+	"github.com/spacemeshos/go-spacemesh/log"
+	"github.com/spacemeshos/go-spacemesh/signing"
 	"github.com/stretchr/testify/require"
 	"testing"
 )
 
-var atxID = types.AtxId{Hash: [32]byte{1, 3, 3, 7}}
+var atxID = types.AtxId([32]byte{1, 3, 3, 7})
 var nodeID, vrfSigner = generateNodeIDAndSigner()
+var validateVrf = BLS381.Verify2
+var privateKey, publicKey = BLS381.GenKeyPair(BLS381.DefaultSeed())
+var ed = signing.NewEdSigner()
 
-func generateNodeIDAndSigner() (types.NodeId, *crypto.VRFSigner) {
-	publicKey, privateKey, _ := crypto.GenerateVRFKeys()
+func generateNodeIDAndSigner() (types.NodeId, Signer) {
 	return types.NodeId{
-		Key:          "key",
+		Key:          ed.PublicKey().String(),
 		VRFPublicKey: publicKey,
-	}, crypto.NewVRFSigner(privateKey)
+	}, BLS381.NewBlsSigner(privateKey)
 }
 
 type mockActivationDB struct {
-	activeSetSize uint32
-	layerIndex    types.LayerID
+	activeSetSize       uint32
+	atxPublicationLayer types.LayerID
+	atxs                map[string]map[types.LayerID]types.AtxId
 }
 
-func (a mockActivationDB) GetNodeAtxIds(node types.NodeId) ([]types.AtxId, error) {
-	if node.Key != nodeID.Key {
-		return []types.AtxId{}, nil
+func (a *mockActivationDB) IsIdentityActive(edId string, layer types.LayerID) (*types.NodeId, bool, types.AtxId, error) {
+	if idmap, ok := a.atxs[edId]; ok {
+		if atxid, ok := idmap[layer]; ok {
+			return &types.NodeId{edId, publicKey}, true, atxid, nil
+		}
 	}
-	return []types.AtxId{atxID}, nil
+	return &types.NodeId{edId, publicKey}, true, *types.EmptyAtxId, nil
 }
 
-func (a mockActivationDB) GetAtx(id types.AtxId) (*types.ActivationTx, error) {
+func (a mockActivationDB) GetIdentity(edId string) (types.NodeId, error) {
+	return types.NodeId{Key: edId, VRFPublicKey: publicKey}, nil
+}
+
+func (a mockActivationDB) GetNodeLastAtxId(node types.NodeId) (types.AtxId, error) {
+	if node.Key != nodeID.Key {
+		return *types.EmptyAtxId, errors.New("not found")
+	}
+	return atxID, nil
+}
+
+func (a mockActivationDB) GetAtxHeader(id types.AtxId) (*types.ActivationTxHeader, error) {
 	if id == atxID {
-		return &types.ActivationTx{ActivationTxHeader: types.ActivationTxHeader{ActiveSetSize: a.activeSetSize,
-			PoETChallenge: types.PoETChallenge{LayerIdx: a.layerIndex}}}, nil
+		atxHeader := &types.ActivationTxHeader{
+			NIPSTChallenge: types.NIPSTChallenge{PubLayerIdx: a.atxPublicationLayer}, ActiveSetSize: a.activeSetSize,
+		}
+		atxHeader.SetId(&id)
+		return atxHeader, nil
 	}
 	return nil, errors.New("wrong atx id")
 }
@@ -46,34 +67,36 @@ func TestBlockOracle(t *testing.T) {
 	// Happy flow with small numbers that can be inspected manually
 	testBlockOracleAndValidator(r, 5, 10, 20)
 	// Big, realistic numbers
-	testBlockOracleAndValidator(r, 3000, 200, 4032)
+	//testBlockOracleAndValidator(r, 3000, 200, 4032)
 	// More miners than blocks (ensure at least one block per activation)
 	testBlockOracleAndValidator(r, 5, 2, 2)
 }
 
-func testBlockOracleAndValidator(r *require.Assertions, activeSetSize uint32, committeeSize int32, layersPerEpoch uint16) {
-	activationDB := &mockActivationDB{activeSetSize: activeSetSize}
+func testBlockOracleAndValidator(r *require.Assertions, activeSetSize uint32, committeeSize uint32, layersPerEpoch uint16) {
+	activationDB := &mockActivationDB{activeSetSize: activeSetSize, atxPublicationLayer: types.LayerID(0), atxs: map[string]map[types.LayerID]types.AtxId{}}
 	beaconProvider := &EpochBeaconProvider{}
-	blockOracle := NewMinerBlockOracle(committeeSize, layersPerEpoch, activationDB, beaconProvider, vrfSigner, nodeID)
-	validator := NewBlockEligibilityValidator(committeeSize, layersPerEpoch, activationDB, beaconProvider,
-		crypto.ValidateVRF)
+	lg := log.NewDefault(nodeID.Key[:5])
+	blockOracle := NewMinerBlockOracle(committeeSize, activeSetSize, layersPerEpoch, activationDB, beaconProvider, vrfSigner, nodeID, func() bool { return true }, lg.WithName("blockOracle"))
+	validator := NewBlockEligibilityValidator(committeeSize, activeSetSize, layersPerEpoch, activationDB, beaconProvider,
+		validateVrf, lg.WithName("blkElgValidator"))
 	numberOfEpochsToTest := 2
 	counterValuesSeen := map[uint32]int{}
-	for layer := uint16(0); layer < layersPerEpoch*uint16(numberOfEpochsToTest); layer++ {
-		activationDB.layerIndex = types.LayerID((layer / layersPerEpoch) * layersPerEpoch)
+	for layer := layersPerEpoch * 2; layer < layersPerEpoch*uint16(numberOfEpochsToTest+2); layer++ {
+		activationDB.atxPublicationLayer = types.LayerID((layer/layersPerEpoch)*layersPerEpoch - 1)
 		layerID := types.LayerID(layer)
 		_, proofs, err := blockOracle.BlockEligible(layerID)
 		r.NoError(err)
 
 		for _, proof := range proofs {
-			block := newBlockWithEligibility(layerID, nodeID, atxID, proof)
-			eligible, err := validator.BlockEligible(block)
+			block := newBlockWithEligibility(layerID, nodeID, atxID, proof, activationDB)
+			eligible, err := validator.BlockSignedAndEligible(block)
 			r.NoError(err, "at layer %d, with layersPerEpoch %d", layer, layersPerEpoch)
 			r.True(eligible, "should be eligible at layer %d, but isn't", layer)
 			counterValuesSeen[proof.J] += 1
 		}
 	}
-	numberOfEligibleBlocks := uint32(committeeSize) * uint32(layersPerEpoch) / activeSetSize
+
+	numberOfEligibleBlocks := committeeSize * uint32(layersPerEpoch) / activeSetSize
 	if numberOfEligibleBlocks == 0 {
 		numberOfEligibleBlocks = 1
 	}
@@ -85,18 +108,38 @@ func testBlockOracleAndValidator(r *require.Assertions, activeSetSize uint32, co
 	r.Len(counterValuesSeen, int(numberOfEligibleBlocks))
 }
 
+func TestBlockOracleInGenesisReturnsNoAtx(t *testing.T) {
+	r := require.New(t)
+	activeSetSize := uint32(5)
+	committeeSize := uint32(10)
+	layersPerEpoch := uint16(20)
+
+	activationDB := &mockActivationDB{activeSetSize: activeSetSize, atxPublicationLayer: types.LayerID(0), atxs: map[string]map[types.LayerID]types.AtxId{}}
+	beaconProvider := &EpochBeaconProvider{}
+	lg := log.NewDefault(nodeID.Key[:5])
+	blockOracle := NewMinerBlockOracle(committeeSize, activeSetSize, layersPerEpoch, activationDB, beaconProvider, vrfSigner, nodeID, func() bool { return true }, lg.WithName("blockOracle"))
+	for layer := uint16(0); layer < layersPerEpoch; layer++ {
+		activationDB.atxPublicationLayer = types.LayerID((layer/layersPerEpoch)*layersPerEpoch - 1)
+		layerID := types.LayerID(layer)
+		atxId, _, err := blockOracle.BlockEligible(layerID)
+		r.NoError(err)
+		r.Equal(*types.EmptyAtxId, atxId)
+	}
+}
+
 func TestBlockOracleEmptyActiveSet(t *testing.T) {
 	r := require.New(t)
 
 	activeSetSize := uint32(0) // Nobody is active 😱
-	committeeSize := int32(200)
+	committeeSize := uint32(200)
 	layersPerEpoch := uint16(10)
 
-	activationDB := &mockActivationDB{activeSetSize: activeSetSize}
+	activationDB := &mockActivationDB{activeSetSize: activeSetSize, atxPublicationLayer: types.LayerID(layersPerEpoch), atxs: map[string]map[types.LayerID]types.AtxId{}}
 	beaconProvider := &EpochBeaconProvider{}
-	blockOracle := NewMinerBlockOracle(committeeSize, layersPerEpoch, activationDB, beaconProvider, vrfSigner, nodeID)
+	lg := log.NewDefault(nodeID.Key[:5])
+	blockOracle := NewMinerBlockOracle(committeeSize, activeSetSize, layersPerEpoch, activationDB, beaconProvider, vrfSigner, nodeID, func() bool { return true }, lg.WithName("blockOracle"))
 
-	_, proofs, err := blockOracle.BlockEligible(0)
+	_, proofs, err := blockOracle.BlockEligible(types.LayerID(layersPerEpoch * 2))
 	r.EqualError(err, "empty active set not allowed")
 	r.Nil(proofs)
 }
@@ -105,16 +148,17 @@ func TestBlockOracleEmptyActiveSetValidation(t *testing.T) {
 	r := require.New(t)
 
 	activeSetSize := uint32(0) // Nobody is active 😰
-	committeeSize := int32(200)
+	committeeSize := uint32(200)
 	layersPerEpoch := uint16(10)
 
-	activationDB := &mockActivationDB{activeSetSize: activeSetSize}
+	activationDB := &mockActivationDB{activeSetSize: activeSetSize, atxPublicationLayer: types.LayerID(layersPerEpoch), atxs: map[string]map[types.LayerID]types.AtxId{}}
 	beaconProvider := &EpochBeaconProvider{}
 
-	validator := NewBlockEligibilityValidator(committeeSize, layersPerEpoch, activationDB, beaconProvider,
-		crypto.ValidateVRF)
-	block := newBlockWithEligibility(0, nodeID, atxID, types.BlockEligibilityProof{})
-	eligible, err := validator.BlockEligible(block)
+	lg := log.NewDefault(nodeID.Key[:5])
+	validator := NewBlockEligibilityValidator(committeeSize, activeSetSize, layersPerEpoch, activationDB, beaconProvider,
+		validateVrf, lg.WithName("blkElgValidator"))
+	block := newBlockWithEligibility(types.LayerID(layersPerEpoch*2), nodeID, atxID, types.BlockEligibilityProof{}, activationDB)
+	eligible, err := validator.BlockSignedAndEligible(block)
 	r.EqualError(err, "empty active set not allowed")
 	r.False(eligible)
 }
@@ -123,22 +167,21 @@ func TestBlockOracleNoActivationsForNode(t *testing.T) {
 	r := require.New(t)
 
 	activeSetSize := uint32(20)
-	committeeSize := int32(200)
+	committeeSize := uint32(200)
 	layersPerEpoch := uint16(10)
-	publicKey, privateKey, err := crypto.GenerateVRFKeys()
-	r.NoError(err)
+	_, publicKey := BLS381.GenKeyPair(BLS381.DefaultSeed())
 	nodeID := types.NodeId{
 		Key:          "other key",
 		VRFPublicKey: publicKey,
 	} // This guy has no activations 🧐
 
-	activationDB := &mockActivationDB{activeSetSize: activeSetSize}
+	activationDB := &mockActivationDB{activeSetSize: activeSetSize, atxPublicationLayer: types.LayerID(layersPerEpoch), atxs: map[string]map[types.LayerID]types.AtxId{}}
 	beaconProvider := &EpochBeaconProvider{}
-	vrfSigner := crypto.NewVRFSigner(privateKey)
-	blockOracle := NewMinerBlockOracle(committeeSize, layersPerEpoch, activationDB, beaconProvider, vrfSigner, nodeID)
+	lg := log.NewDefault(nodeID.Key[:5])
+	blockOracle := NewMinerBlockOracle(committeeSize, activeSetSize, layersPerEpoch, activationDB, beaconProvider, vrfSigner, nodeID, func() bool { return true }, lg.WithName("blockOracle"))
 
-	_, proofs, err := blockOracle.BlockEligible(0)
-	r.EqualError(err, "no activations found")
+	_, proofs, err := blockOracle.BlockEligible(types.LayerID(layersPerEpoch * 2))
+	r.EqualError(err, "failed to get latest ATX: not in genesis (epoch 2) yet failed to get atx: not found")
 	r.Nil(proofs)
 }
 
@@ -146,14 +189,15 @@ func TestBlockOracleValidatorInvalidProof(t *testing.T) {
 	r := require.New(t)
 
 	activeSetSize := uint32(1)
-	committeeSize := int32(10)
+	committeeSize := uint32(10)
 	layersPerEpoch := uint16(20)
 
-	activationDB := &mockActivationDB{activeSetSize: activeSetSize}
+	activationDB := &mockActivationDB{activeSetSize: activeSetSize, atxPublicationLayer: types.LayerID(layersPerEpoch), atxs: map[string]map[types.LayerID]types.AtxId{}}
 	beaconProvider := &EpochBeaconProvider{}
-	blockOracle := NewMinerBlockOracle(committeeSize, layersPerEpoch, activationDB, beaconProvider, vrfSigner, nodeID)
+	lg := log.NewDefault(nodeID.Key[:5])
+	blockOracle := NewMinerBlockOracle(committeeSize, activeSetSize, layersPerEpoch, activationDB, beaconProvider, vrfSigner, nodeID, func() bool { return true }, lg.WithName("blockOracle"))
 
-	layerID := types.LayerID(0)
+	layerID := types.LayerID(layersPerEpoch * 2)
 
 	_, proofs, err := blockOracle.BlockEligible(layerID)
 	r.NoError(err)
@@ -162,26 +206,28 @@ func TestBlockOracleValidatorInvalidProof(t *testing.T) {
 	proof := proofs[0]
 	proof.Sig[0] += 1 // Messing with the proof 😈
 
-	validator := NewBlockEligibilityValidator(committeeSize, layersPerEpoch, activationDB, beaconProvider,
-		crypto.ValidateVRF)
-	block := newBlockWithEligibility(layerID, nodeID, atxID, proof)
-	eligible, err := validator.BlockEligible(block)
+	validator := NewBlockEligibilityValidator(committeeSize, activeSetSize, layersPerEpoch, activationDB, beaconProvider,
+		validateVrf, lg.WithName("blkElgValidator"))
+	block := newBlockWithEligibility(layerID, nodeID, atxID, proof, activationDB)
+	eligible, err := validator.BlockSignedAndEligible(block)
 	r.False(eligible)
-	r.EqualError(err, "VRF validation failed")
+	r.Nil(err)
 }
 
 func TestBlockOracleValidatorInvalidProof2(t *testing.T) {
 	r := require.New(t)
 
-	committeeSize := int32(10)
+	committeeSize := uint32(10)
 	layersPerEpoch := uint16(1)
-	minerActivationDB := &mockActivationDB{activeSetSize: 1}
-	validatorActivationDB := &mockActivationDB{activeSetSize: 10} // Use different active set size to get more blocks 🤫
+	minerActivationDB := &mockActivationDB{activeSetSize: 1, atxPublicationLayer: types.LayerID(layersPerEpoch), atxs: map[string]map[types.LayerID]types.AtxId{}}
+	// Use different active set size to get more blocks 🤫
+	validatorActivationDB := &mockActivationDB{activeSetSize: 10, atxPublicationLayer: types.LayerID(layersPerEpoch), atxs: map[string]map[types.LayerID]types.AtxId{}}
 
 	beaconProvider := &EpochBeaconProvider{}
-	blockOracle := NewMinerBlockOracle(committeeSize, layersPerEpoch, minerActivationDB, beaconProvider, vrfSigner, nodeID)
+	lg := log.NewDefault(nodeID.Key[:5])
+	blockOracle := NewMinerBlockOracle(committeeSize, 5, layersPerEpoch, minerActivationDB, beaconProvider, vrfSigner, nodeID, func() bool { return true }, lg.WithName("blockOracle"))
 
-	layerID := types.LayerID(0)
+	layerID := types.LayerID(layersPerEpoch * 2)
 
 	_, proofs, err := blockOracle.BlockEligible(layerID)
 	r.NoError(err)
@@ -192,10 +238,10 @@ func TestBlockOracleValidatorInvalidProof2(t *testing.T) {
 		proof = proofs[i]
 	}
 
-	validator := NewBlockEligibilityValidator(committeeSize, layersPerEpoch, validatorActivationDB, beaconProvider,
-		crypto.ValidateVRF)
-	block := newBlockWithEligibility(layerID, nodeID, atxID, proof)
-	eligible, err := validator.BlockEligible(block)
+	validator := NewBlockEligibilityValidator(committeeSize, 5, layersPerEpoch, validatorActivationDB, beaconProvider,
+		validateVrf, lg.WithName("blkElgValidator"))
+	block := newBlockWithEligibility(layerID, nodeID, atxID, proof, validatorActivationDB)
+	eligible, err := validator.BlockSignedAndEligible(block)
 	r.False(eligible)
 	r.EqualError(err, fmt.Sprintf("proof counter (%d) must be less than number of eligible blocks (1)", proof.J))
 }
@@ -204,14 +250,15 @@ func TestBlockOracleValidatorInvalidProof3(t *testing.T) {
 	r := require.New(t)
 
 	activeSetSize := uint32(1)
-	committeeSize := int32(10)
+	committeeSize := uint32(10)
 	layersPerEpoch := uint16(20)
 
-	activationDB := &mockActivationDB{activeSetSize: activeSetSize}
+	activationDB := &mockActivationDB{activeSetSize: activeSetSize, atxPublicationLayer: types.LayerID(layersPerEpoch), atxs: map[string]map[types.LayerID]types.AtxId{}}
 	beaconProvider := &EpochBeaconProvider{}
-	blockOracle := NewMinerBlockOracle(committeeSize, layersPerEpoch, activationDB, beaconProvider, vrfSigner, nodeID)
+	lg := log.NewDefault(nodeID.Key[:5])
+	blockOracle := NewMinerBlockOracle(committeeSize, activeSetSize, layersPerEpoch, activationDB, beaconProvider, vrfSigner, nodeID, func() bool { return true }, lg.WithName("blockOracle"))
 
-	layerID := types.LayerID(20)
+	layerID := types.LayerID(layersPerEpoch * 2)
 
 	_, proofs, err := blockOracle.BlockEligible(layerID)
 	r.NoError(err)
@@ -222,17 +269,58 @@ func TestBlockOracleValidatorInvalidProof3(t *testing.T) {
 		proof = proofs[i]
 	}
 
-	validator := NewBlockEligibilityValidator(committeeSize, layersPerEpoch, activationDB, beaconProvider,
-		crypto.ValidateVRF)
-	block := newBlockWithEligibility(layerID, nodeID, atxID, proof)
-	eligible, err := validator.BlockEligible(block)
+	validatorActivationDB := &mockActivationDB{activeSetSize: activeSetSize, atxPublicationLayer: types.LayerID(0), atxs: activationDB.atxs}
+	validator := NewBlockEligibilityValidator(committeeSize, activeSetSize, layersPerEpoch, validatorActivationDB, beaconProvider,
+		validateVrf, lg.WithName("blkElgValidator"))
+	block := newBlockWithEligibility(layerID, nodeID, atxID, proof, activationDB)
+	eligible, err := validator.BlockSignedAndEligible(block)
 	r.False(eligible)
-	r.EqualError(err, "activation epoch (0) mismatch with layer epoch (1)")
+	r.EqualError(err, "ATX target epoch (1) doesn't match block publication epoch (2)")
 }
 
 func newBlockWithEligibility(layerID types.LayerID, nodeID types.NodeId, atxID types.AtxId,
-	proof types.BlockEligibilityProof) *types.Block {
+	proof types.BlockEligibilityProof, db *mockActivationDB) *types.Block {
+	block := &types.Block{MiniBlock: types.MiniBlock{BlockHeader: types.BlockHeader{LayerIndex: layerID, ATXID: atxID, EligibilityProof: proof}}}
+	block.Signature = ed.Sign(block.Bytes())
+	if _, ok := db.atxs[ed.PublicKey().String()]; !ok {
+		db.atxs[ed.PublicKey().String()] = map[types.LayerID]types.AtxId{}
+	}
+	db.atxs[ed.PublicKey().String()][layerID] = atxID
+	return block
+}
 
-	return &types.Block{BlockHeader: types.BlockHeader{LayerIndex: layerID, MinerID: nodeID, ATXID: atxID,
-		EligibilityProof: proof}}
+func TestBlockEligibility_calc(t *testing.T) {
+	r := require.New(t)
+	atxH := types.NewActivationTxWithChallenge(types.NIPSTChallenge{PubLayerIdx: 0}, types.Address{}, 1, nil, nil, nil)
+	atxH.ActiveSetSize = 10
+	atxDb := &mockAtxDB{atxH: atxH.ActivationTxHeader}
+	genSetSize := uint32(0)
+	o := NewMinerBlockOracle(10, genSetSize, 1, atxDb, &EpochBeaconProvider{}, vrfSigner, nodeID, func() bool { return true }, log.NewDefault(t.Name()))
+	err := o.calcEligibilityProofs(1)
+	r.EqualError(err, "empty active set not allowed") // a hack to make sure we got genesis active set size on genesis
+}
+
+func TestMinerBlockOracle_GetEligibleLayers(t *testing.T) {
+	r := require.New(t)
+	activeSetSize := uint32(5)
+	committeeSize := uint32(10)
+	layersPerEpoch := uint16(20)
+
+	activationDB := &mockActivationDB{activeSetSize: activeSetSize, atxPublicationLayer: types.LayerID(0), atxs: map[string]map[types.LayerID]types.AtxId{}}
+	beaconProvider := &EpochBeaconProvider{}
+	lg := log.NewDefault(nodeID.Key[:5])
+	blockOracle := NewMinerBlockOracle(committeeSize, activeSetSize, layersPerEpoch, activationDB, beaconProvider, vrfSigner, nodeID, func() bool { return true }, lg.WithName("blockOracle"))
+	numberOfEpochsToTest := 1 // this test supports only 1 epoch
+	eligibleLayers := 0
+	for layer := layersPerEpoch * 2; layer < layersPerEpoch*uint16(numberOfEpochsToTest+2); layer++ {
+		activationDB.atxPublicationLayer = types.LayerID((layer/layersPerEpoch)*layersPerEpoch - 1)
+		layerID := types.LayerID(layer)
+		_, proofs, err := blockOracle.BlockEligible(layerID)
+		r.NoError(err)
+		if len(proofs) > 0 {
+			eligibleLayers++
+		}
+	}
+	r.Equal(eligibleLayers, len(blockOracle.GetEligibleLayers()))
+
 }

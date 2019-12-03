@@ -1,41 +1,46 @@
 package api
 
 import (
-	"context"
-	"github.com/spacemeshos/go-spacemesh/address"
+	"github.com/spacemeshos/go-spacemesh/common/types"
 	"github.com/spacemeshos/go-spacemesh/p2p/service"
-	"math/big"
+	"time"
 )
-
-const APIGossipProtocol = "api_test_gossip"
 
 type Service interface {
 	RegisterGossipProtocol(string) chan service.GossipMessage
 }
 
-// ApproveAPIGossipMessages registers the gossip api test protocol and approves every message as valid
-func ApproveAPIGossipMessages(ctx context.Context, s Service) {
-	gm := s.RegisterGossipProtocol(APIGossipProtocol)
-	go func() {
-		for {
-			select {
-			case m := <-gm:
-				m.ReportValidation(APIGossipProtocol)
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-}
-
 type StateAPI interface {
-	GetBalance(address address.Address) *big.Int
+	GetBalance(address types.Address) uint64
 
-	GetNonce(address address.Address) uint64
+	GetNonce(address types.Address) uint64
 
-	Exist(address address.Address) bool
+	Exist(address types.Address) bool
 }
 
 type NetworkAPI interface {
 	Broadcast(channel string, data []byte) error
+}
+
+type MiningAPI interface {
+	StartPost(address types.Address, datadir string, space uint64) error
+	SetCoinbaseAccount(rewardAddress types.Address)
+	// MiningStats returns state of post init, coinbase reward account and data directory path for post commitment
+	MiningStats() (int, string, string)
+}
+
+type OracleAPI interface {
+	GetEligibleLayers() []types.LayerID
+}
+
+type GenesisTimeAPI interface {
+	GetGenesisTime() time.Time
+}
+
+type LoggingAPI interface {
+	SetLogLevel(loggerName, severity string) error
+}
+
+type PostAPI interface {
+	Reset() error
 }
