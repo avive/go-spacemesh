@@ -5,6 +5,7 @@ cmd/tmp
 /app/tmp
 */**/*un~
 */**/*.test
+*.zip
 */**/temp.js
 .DS_Store
 */**/.DS_Store
